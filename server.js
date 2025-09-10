@@ -19,8 +19,19 @@ dotenv.config();
 const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379/0';
 const redis = new Redis(REDIS_URL);
 
+// Default config
+const DEFAULT_ROUTE_URL = process.env.DEFAULT_ROUTE_URL || '';
+const DEFAULTS = {
+	chunkSize: 5,            // количество запросов в пачке
+	reqDelay: 100,            // задержка между запросами (мс)
+	chunkDelay: 500,          // задержка между пачками (мс)
+	reqTimeout: 30_000,       // таймаут на один запрос (мс)
+	sessionTimeout: 3_600_000, // общий таймаут сессии (мс)
+	connLimit: 10             // максимальное число соединений (параллельных запросов)
+};
+
 // HTTP keep-alive for better throughput
-const KEEPALIVE_CONNECTIONS = Number(process.env.KEEPALIVE_CONNECTIONS) || 128;
+const KEEPALIVE_CONNECTIONS = Number(process.env.KEEPALIVE_CONNECTIONS) || DEFAULTS.connLimit;
 const keepAliveAgent = new Agent({
 	keepAliveTimeout: 10_000,
 	keepAliveMaxTimeout: 60_000,
@@ -28,17 +39,8 @@ const keepAliveAgent = new Agent({
 });
 setGlobalDispatcher(keepAliveAgent);
 
-// Default config
-const DEFAULT_ROUTE_URL = process.env.DEFAULT_ROUTE_URL || '';
-const DEFAULTS = {
-	chunkSize: 10,
-	reqDelay: 100,
-	chunkDelay: 500,
-	timeout: 50_000,
-};
-
 // Global concurrency limiter
-const MAX_CONCURRENCY = Math.max(1, Number(process.env.MAX_CONCURRENCY) || 50);
+const MAX_CONCURRENCY = Math.max(1, Number(process.env.MAX_CONCURRENCY) || DEFAULTS.connLimit);
 let concurrencyInUse = 0;
 const concurrencyWaiters = [];
 async function acquireConcurrency() {
@@ -97,7 +99,7 @@ function buildUrl(baseUrl, pixel, row) {
 	return url;
 }
 
-async function sendRequest({ baseUrl, pixel, row, index, reqDelay, timeout, progress, jobId }) {
+async function sendRequest({ baseUrl, pixel, row, index, reqDelay, reqTimeout, progress, jobId }) {
 	try {
 		// Fast cancel check before doing anything
 		if (await isCancelled(jobId)) return null;
@@ -111,7 +113,7 @@ async function sendRequest({ baseUrl, pixel, row, index, reqDelay, timeout, prog
 
 		return await withConcurrency(async () => {
 			const controller = new AbortController();
-			const timeoutId = setTimeout(() => controller.abort(), timeout);
+			const timeoutId = setTimeout(() => controller.abort(), reqTimeout);
 			try {
 				const response = await fetch(url, { method: 'GET', signal: controller.signal });
 				clearTimeout(timeoutId);
@@ -140,8 +142,8 @@ async function sendRequest({ baseUrl, pixel, row, index, reqDelay, timeout, prog
 				progress.errors += 1;
 				const isAbort = (err && (err.name === 'AbortError' || String(err).includes('AbortError')));
 				if (isAbort) {
-					progress.logs.push({ level: 'error', msg: `Timeout after ${timeout}ms`, url });
-					console.error(`[job ${jobId}] Timeout after ${timeout}ms | ${url}`);
+					progress.logs.push({ level: 'error', msg: `Timeout after ${reqTimeout}ms`, url });
+					console.error(`[job ${jobId}] Timeout after ${reqTimeout}ms | ${url}`);
 				} else {
 					progress.logs.push({ level: 'error', msg: `Fetch error: ${String(err)}` });
 					console.error(`[job ${jobId}] Fetch error: ${String(err)}`);
@@ -195,10 +197,13 @@ async function redisUpdateJob(job) {
 }
 
 async function runJob(job) {
-	const { id, pixel, file, baseUrl, chunkSize, reqDelay, chunkDelay, timeout } = job;
+	const { id, pixel, file, baseUrl, chunkSize, reqDelay, chunkDelay, reqTimeout, sessionTimeout } = job;
 	job.status = 'running';
 	job.startedAt = new Date().toISOString();
 	await redisUpdateJob(job);
+
+	const startedAtMs = Date.now();
+	const sessionDeadline = startedAtMs + Number(sessionTimeout || DEFAULTS.sessionTimeout);
 
 	console.log(`Attempting to read file: ${file}`);
 	
@@ -286,9 +291,19 @@ async function runJob(job) {
 	const chunks = chunkArray(indexed, chunkSize);
 	const successfulIndices = [];
 
-	const sessionOpts = { baseUrl, pixel, reqDelay, timeout, progress: job.progress, jobId: id };
+	const sessionOpts = { baseUrl, pixel, reqDelay, reqTimeout, progress: job.progress, jobId: id };
 
 	for (const chunk of chunks) {
+		// Session timeout check
+		if (Date.now() > sessionDeadline) {
+			job.status = 'failed';
+			job.error = `Session timeout after ${Number(sessionTimeout || DEFAULTS.sessionTimeout)}ms`;
+			job.finishedAt = new Date().toISOString();
+			await setCancelled(id);
+			await redisUpdateJob(job);
+			console.error(`[job ${id}] session timeout`);
+			return;
+		}
 		// Fast cancel check from Redis before each chunk
 		if (await isCancelled(id)) {
 			job.cancelled = true;
@@ -314,7 +329,7 @@ async function runJob(job) {
 }
 
 // Redis-backed job store API
-async function createJob({ pixel, file, baseUrl, chunkSize, reqDelay, chunkDelay, timeout, leadsCount = 0, salesCount = 0, clientId = null }) {
+async function createJob({ pixel, file, baseUrl, chunkSize, reqDelay, chunkDelay, reqTimeout, sessionTimeout, connLimit, leadsCount = 0, salesCount = 0, clientId = null }) {
 	const id = crypto.randomUUID();
 	const job = {
 		id,
@@ -328,7 +343,9 @@ async function createJob({ pixel, file, baseUrl, chunkSize, reqDelay, chunkDelay
 		chunkSize,
 		reqDelay,
 		chunkDelay,
-		timeout,
+		reqTimeout,
+		sessionTimeout,
+		connLimit,
 		progress: { sent: 0, total: 0, errors: 0, leads: 0, sales: 0, logs: [] },
 		error: null,
 		cancelled: false,
@@ -433,11 +450,17 @@ router.post('/send', async (req, res) => {
 		chunkSize = DEFAULTS.chunkSize,
 		reqDelay = DEFAULTS.reqDelay,
 		chunkDelay = DEFAULTS.chunkDelay,
-		timeout = DEFAULTS.timeout,
+		reqTimeout = DEFAULTS.reqTimeout,
+		sessionTimeout = DEFAULTS.sessionTimeout,
+		connLimit = DEFAULTS.connLimit,
 		leadsCount = 0,
 		salesCount = 0,
 		clientId: clientIdBody = null,
+		// Backward compat: allow "timeout" to set reqTimeout if provided
+		timeout,
 	} = req.body || {};
+
+	const effectiveReqTimeout = Number(timeout) || Number(reqTimeout) || DEFAULTS.reqTimeout;
 
 	if (!pixel || !file) {
 		return res.status(400).json({ error: 'Fields "pixel" and "file" are required' });
@@ -487,7 +510,9 @@ router.post('/send', async (req, res) => {
 		chunkSize: Number(chunkSize),
 		reqDelay: Number(reqDelay),
 		chunkDelay: Number(chunkDelay),
-		timeout: Number(timeout),
+		reqTimeout: Number(effectiveReqTimeout),
+		sessionTimeout: Number(sessionTimeout) || DEFAULTS.sessionTimeout,
+		connLimit: Number(connLimit) || DEFAULTS.connLimit,
 		leadsCount: Number(leadsCount) || 0,
 		salesCount: Number(salesCount) || 0,
 		clientId: String(clientIdHeader || clientIdBody || req.clientId || ''),
