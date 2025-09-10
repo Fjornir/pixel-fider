@@ -9,18 +9,54 @@ import { parse } from 'csv-parse/sync';
 import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { Agent, setGlobalDispatcher } from 'undici';
 
 // Load env once at startup
 dotenv.config();
 
+// HTTP keep-alive for better throughput
+const KEEPALIVE_CONNECTIONS = Number(process.env.KEEPALIVE_CONNECTIONS) || 128;
+const keepAliveAgent = new Agent({
+  keepAliveTimeout: 10_000,
+  keepAliveMaxTimeout: 60_000,
+  connections: KEEPALIVE_CONNECTIONS,
+});
+setGlobalDispatcher(keepAliveAgent);
+
 // Default config
 const DEFAULT_ROUTE_URL = process.env.DEFAULT_ROUTE_URL || '';
 const DEFAULTS = {
-  chunkSize: 5,
+  chunkSize: 20,
   reqDelay: 100,
-  chunkDelay: 500,
+  chunkDelay: 0,
   timeout: 30_000,
 };
+
+// Global concurrency limiter
+const MAX_CONCURRENCY = Math.max(1, Number(process.env.MAX_CONCURRENCY) || 50);
+let concurrencyInUse = 0;
+const concurrencyWaiters = [];
+async function acquireConcurrency() {
+  if (concurrencyInUse < MAX_CONCURRENCY) {
+    concurrencyInUse += 1;
+    return;
+  }
+  await new Promise((resolve) => concurrencyWaiters.push(resolve));
+  concurrencyInUse += 1;
+}
+function releaseConcurrency() {
+  concurrencyInUse -= 1;
+  const next = concurrencyWaiters.shift();
+  if (next) next();
+}
+async function withConcurrency(fn) {
+  await acquireConcurrency();
+  try {
+    return await fn();
+  } finally {
+    releaseConcurrency();
+  }
+}
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -56,38 +92,39 @@ async function sendRequest({ baseUrl, pixel, row, index, reqDelay, timeout, prog
     // Delay between requests
     await sleep(reqDelay);
 
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeout);
+    return await withConcurrency(async () => {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), timeout);
+      try {
+        const response = await fetch(url, { method: 'GET', signal: controller.signal });
+        clearTimeout(timeoutId);
 
-    try {
-      const response = await fetch(url, { method: 'GET', signal: controller.signal });
-      clearTimeout(timeoutId);
-
-      if (response.ok) {
-        progress.sent += 1;
-        progress.logs.push({ level: 'info', msg: `OK ${progress.sent}/${progress.total}`, url, status: response.status });
-        // Increment per-type counters (lead/sale)
-        try {
-          const statusKind = mapStatus(row['\u0421\u0442\u0430\u0442\u0443\u0441'] ?? row['Статус']);
-          if (statusKind === 'lead') progress.leads += 1;
-          else if (statusKind === 'sale') progress.sales += 1;
-        } catch {}
-        return index;
-      } else {
-        let content = '';
-        try { content = await response.text(); } catch {}
+        if (response.ok) {
+          progress.sent += 1;
+          progress.logs.push({ level: 'info', msg: `OK ${progress.sent}/${progress.total}`, url, status: response.status });
+          // Increment per-type counters (lead/sale)
+          try {
+            const statusKind = mapStatus(row['\u0421\u0442\u0430\u0441\u0442\u0443\u0441'] ?? row['Статус']);
+            if (statusKind === 'lead') progress.leads += 1;
+            else if (statusKind === 'sale') progress.sales += 1;
+          } catch {}
+          return index;
+        } else {
+          let content = '';
+          try { content = await response.text(); } catch {}
+          progress.errors += 1;
+          progress.logs.push({ level: 'error', msg: `HTTP ${response.status}`, url, content });
+          // Log only errors to console with compact, single-line output
+          console.error(`[job ${jobId}] HTTP ${response.status} | ${url} | ${content?.slice(0,200) ?? ''}`);
+          return null;
+        }
+      } catch (err) {
         progress.errors += 1;
-        progress.logs.push({ level: 'error', msg: `HTTP ${response.status}`, url, content });
-        // Log only errors to console with compact, single-line output
-        console.error(`[job ${jobId}] HTTP ${response.status} | ${url} | ${content?.slice(0,200) ?? ''}`);
+        progress.logs.push({ level: 'error', msg: `Fetch error: ${String(err)}` });
+        console.error(`[job ${jobId}] Fetch error: ${String(err)}`);
         return null;
       }
-    } catch (err) {
-      progress.errors += 1;
-      progress.logs.push({ level: 'error', msg: `Fetch error: ${String(err)}` });
-      console.error(`[job ${jobId}] Fetch error: ${String(err)}`);
-      return null;
-    }
+    });
   } catch (outerErr) {
     console.error(`[job ${jobId}] Unexpected error: ${String(outerErr)}`);
     return null;
@@ -213,7 +250,7 @@ async function runJob(job) {
 
   job.status = job.error ? 'completed_with_errors' : 'completed';
   job.finishedAt = new Date().toISOString();
-  console.log(`[job ${id}] ${job.status} | ok=${job.progress.sent}/${job.progress.total} errors=${job.progress.errors} leads=${job.progress.leads} sales=${job.progress.sales}`);
+  console.log(`[job ${id}] ${job.status} | ok=${job.progress.sent}/${job.progress.total} errors=${job.progress.errors} leads=${job.progress.leads} sales=${job.progress.sales} | maxConcurrency=${MAX_CONCURRENCY} keepAliveConns=${KEEPALIVE_CONNECTIONS}`);
 }
 
 // In-memory job store
