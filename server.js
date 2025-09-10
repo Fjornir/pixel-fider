@@ -8,6 +8,7 @@ import fsSync from 'node:fs';
 import { parse } from 'csv-parse/sync';
 import crypto from 'node:crypto';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 // Load env once at startup
 dotenv.config();
@@ -254,6 +255,12 @@ app.use(express.json());
 // Optional base path for mounting the entire app (UI + API) under a subpath
 const BASE_PATH = process.env.BASE_PATH || '/pixel';
 const router = express.Router();
+
+// Resolve project directories independent of process.cwd()
+const __FILENAME = fileURLToPath(import.meta.url);
+const __DIRNAME = path.dirname(__FILENAME);
+const PUBLIC_DIR = path.resolve(__DIRNAME, 'public');
+const COUNTRIES_DIR = process.env.COUNTRIES_DIR || path.resolve(__DIRNAME, 'countries');
 // Assign or read per-user clientId via cookie for isolation
 function parseCookies(header) {
   const out = {};
@@ -281,7 +288,7 @@ function ensureClientId(req, res, next) {
 
 app.use(ensureClientId);
 // Serve static UI under base path
-router.use(express.static(path.resolve(process.cwd(), 'public')));
+router.use(express.static(PUBLIC_DIR));
 
 router.get('/health', (_req, res) => {
   res.json({ ok: true, serverTime: new Date().toISOString() });
@@ -295,8 +302,7 @@ router.get('/', (_req, res) => {
 // List available country CSV files from countries/ directory
 router.get('/countries', async (_req, res) => {
   try {
-    const dir = path.resolve(process.cwd(), 'countries');
-    const entries = await fs.readdir(dir, { withFileTypes: true });
+    const entries = await fs.readdir(COUNTRIES_DIR, { withFileTypes: true });
     const items = entries
       .filter((e) => e.isFile() && e.name.toLowerCase().endsWith('.csv'))
       .map((e) => {
@@ -341,7 +347,7 @@ router.post('/send', (req, res) => {
     return res.status(400).json({ error: 'Fields "pixel" and "file" are required' });
   }
 
-  // Resolve file: if a bare name like "in" is provided, use countries/in.csv
+  // Resolve file: if a bare name like "in" is provided, use countries/in.csv (under COUNTRIES_DIR)
   const resolveFilePath = (input) => {
     try {
       console.log('Resolving file path for input:', input);
@@ -350,12 +356,12 @@ router.post('/send', (req, res) => {
       
       let resolvedPath;
       if (hasSeparator) {
-        // Treat as path (relative or absolute) as-is
-        resolvedPath = path.resolve(process.cwd(), input);
+        // Treat as path (relative or absolute)
+        resolvedPath = path.resolve(input);
       } else {
         // No separator: treat as countries/<name>[.csv]
         const baseName = hasCsvExt ? input : `${input}.csv`;
-        resolvedPath = path.resolve(process.cwd(), 'countries', baseName);
+        resolvedPath = path.resolve(COUNTRIES_DIR, baseName);
       }
       
       console.log('Resolved path:', resolvedPath);
