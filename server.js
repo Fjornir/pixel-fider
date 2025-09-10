@@ -31,9 +31,9 @@ setGlobalDispatcher(keepAliveAgent);
 // Default config
 const DEFAULT_ROUTE_URL = process.env.DEFAULT_ROUTE_URL || '';
 const DEFAULTS = {
-	chunkSize: 5,
-	reqDelay: 100,
-	chunkDelay: 500,
+	chunkSize: 20,
+	reqDelay: 70,
+	chunkDelay: 0,
 	timeout: 30_000,
 };
 
