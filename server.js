@@ -2,14 +2,18 @@
 // Node 18+ required. Starts an HTTP API to run pixel-send jobs in parallel.
 
 import express from 'express';
+import dotenv from 'dotenv';
 import fs from 'node:fs/promises';
 import fsSync from 'node:fs';
 import { parse } from 'csv-parse/sync';
 import crypto from 'node:crypto';
 import path from 'node:path';
 
+// Load env once at startup
+dotenv.config();
+
 // Default config
-const DEFAULT_ROUTE_URL = 'http://91.210.164.25:3001/api/send';
+const DEFAULT_ROUTE_URL = process.env.DEFAULT_ROUTE_URL || '';
 const DEFAULTS = {
   chunkSize: 5,
   reqDelay: 100,
@@ -248,7 +252,7 @@ function createJob({ pixel, file, baseUrl, chunkSize, reqDelay, chunkDelay, time
 const app = express();
 app.use(express.json());
 // Optional base path for mounting the entire app (UI + API) under a subpath
-const BASE_PATH = process.env.BASE_PATH || '/';
+const BASE_PATH = process.env.BASE_PATH || '/pixel';
 const router = express.Router();
 // Assign or read per-user clientId via cookie for isolation
 function parseCookies(header) {
