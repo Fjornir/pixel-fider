@@ -10,9 +10,14 @@ import crypto from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Agent, setGlobalDispatcher } from 'undici';
+import Redis from 'ioredis';
 
 // Load env once at startup
 dotenv.config();
+
+// Redis client
+const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379/0';
+const redis = new Redis(REDIS_URL);
 
 // HTTP keep-alive for better throughput
 const KEEPALIVE_CONNECTIONS = Number(process.env.KEEPALIVE_CONNECTIONS) || 128;
@@ -151,10 +156,37 @@ function chunkArray(arr, size) {
 	return out;
 }
 
+// Redis helpers for jobs storage
+async function redisSaveJob(job) {
+	await redis.set(`job:${job.id}`, JSON.stringify(job));
+	if (job.clientId) {
+		await redis.zadd(`jobs:byClient:${job.clientId}`, Date.parse(job.createdAt) || Date.now(), job.id);
+	}
+}
+async function redisGetJob(id) {
+	const data = await redis.get(`job:${id}`);
+	return data ? JSON.parse(data) : null;
+}
+async function redisListJobsByClient(clientId, limit = 100) {
+	const ids = await redis.zrevrange(`jobs:byClient:${clientId}`, 0, limit - 1);
+	if (!ids.length) return [];
+	const pipeline = redis.pipeline();
+	for (const id of ids) pipeline.get(`job:${id}`);
+	const res = await pipeline.exec();
+	return res
+		.map(([, val]) => (val ? JSON.parse(val) : null))
+		.filter(Boolean)
+		.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+}
+async function redisUpdateJob(job) {
+	await redis.set(`job:${job.id}`, JSON.stringify(job));
+}
+
 async function runJob(job) {
 	const { id, pixel, file, baseUrl, chunkSize, reqDelay, chunkDelay, timeout } = job;
 	job.status = 'running';
 	job.startedAt = new Date().toISOString();
+	await redisUpdateJob(job);
 
 	console.log(`Attempting to read file: ${file}`);
 	
@@ -169,6 +201,7 @@ async function runJob(job) {
 		job.status = 'failed';
 		job.error = errorMsg;
 		job.finishedAt = new Date().toISOString();
+		await redisUpdateJob(job);
 		return;
 	}
 
@@ -215,6 +248,7 @@ async function runJob(job) {
 		job.status = 'failed';
 		job.error = `Ошибка парсинга CSV: ${e}`;
 		job.finishedAt = new Date().toISOString();
+		await redisUpdateJob(job);
 		return;
 	}
 
@@ -225,7 +259,7 @@ async function runJob(job) {
 		let leadsLeft = job.limits.leads || 0;
 		let salesLeft = job.limits.sales || 0;
 		for (const rec of records) {
-			const kind = mapStatus(rec['\u0421\u0442\u0430\u0442\u0443\u0441'] ?? rec['Статус']);
+			const kind = mapStatus(rec['\u0421\u0442\u0430\u0441\u0442\u0443\u0441'] ?? rec['Статус']);
 			if (kind === 'lead' && leadsLeft > 0) { limited.push(rec); leadsLeft--; }
 			else if (kind === 'sale' && salesLeft > 0) { limited.push(rec); salesLeft--; }
 			if (leadsLeft <= 0 && salesLeft <= 0) break;
@@ -234,6 +268,7 @@ async function runJob(job) {
 	}
 
 	job.progress.total = records.length;
+	await redisUpdateJob(job);
 
 	const indexed = records.map((row, index) => ({ row, index }));
 	const chunks = chunkArray(indexed, chunkSize);
@@ -242,14 +277,19 @@ async function runJob(job) {
 	const sessionOpts = { baseUrl, pixel, reqDelay, timeout, progress: job.progress, jobId: id };
 
 	for (const chunk of chunks) {
-		if (job.cancelled) {
+		// Reload cancellation flag from Redis before each chunk
+		const fresh = await redisGetJob(id);
+		if (fresh?.cancelled) {
+			job.cancelled = true;
 			job.status = 'cancelled';
 			job.finishedAt = new Date().toISOString();
+			await redisUpdateJob(job);
 			console.log(`[job ${id}] cancelled | ok=${job.progress.sent}/${job.progress.total} errors=${job.progress.errors} leads=${job.progress.leads} sales=${job.progress.sales}`);
 			return;
 		}
 		const results = await processChunk(sessionOpts, chunk);
 		for (const idx of results) if (idx !== null && idx !== undefined) successfulIndices.push(idx);
+		await redisUpdateJob(job);
 		await sleep(chunkDelay);
 	}
 
@@ -257,13 +297,12 @@ async function runJob(job) {
 
 	job.status = job.error ? 'completed_with_errors' : 'completed';
 	job.finishedAt = new Date().toISOString();
+	await redisUpdateJob(job);
 	console.log(`[job ${id}] ${job.status} | ok=${job.progress.sent}/${job.progress.total} errors=${job.progress.errors} leads=${job.progress.leads} sales=${job.progress.sales} | maxConcurrency=${MAX_CONCURRENCY} keepAliveConns=${KEEPALIVE_CONNECTIONS}`);
 }
 
-// In-memory job store
-const jobs = new Map();
-
-function createJob({ pixel, file, baseUrl, chunkSize, reqDelay, chunkDelay, timeout, leadsCount = 0, salesCount = 0, clientId = null }) {
+// Redis-backed job store API
+async function createJob({ pixel, file, baseUrl, chunkSize, reqDelay, chunkDelay, timeout, leadsCount = 0, salesCount = 0, clientId = null }) {
 	const id = crypto.randomUUID();
 	const job = {
 		id,
@@ -284,12 +323,13 @@ function createJob({ pixel, file, baseUrl, chunkSize, reqDelay, chunkDelay, time
 		limits: { leads: Number(leadsCount) || 0, sales: Number(salesCount) || 0 },
 		clientId: clientId || crypto.randomUUID(),
 	};
-	jobs.set(id, job);
+	await redisSaveJob(job);
 	// Fire and forget
-	runJob(job).catch((e) => {
+	runJob(job).catch(async (e) => {
 		job.status = 'failed';
 		job.error = `Непредвиденная ошибка: ${e}`;
 		job.finishedAt = new Date().toISOString();
+		await redisUpdateJob(job);
 	});
 	return job;
 }
@@ -373,7 +413,7 @@ router.get('/countries', async (_req, res) => {
 });
 
 // Create and start a new job
-router.post('/send', (req, res) => {
+router.post('/send', async (req, res) => {
 	const {
 		pixel,
 		file,
@@ -428,7 +468,7 @@ router.post('/send', (req, res) => {
 	const resolvedFile = resolveFilePath(String(file));
 
 	const clientIdHeader = req.get('x-client-id');
-	const job = createJob({
+	const job = await createJob({
 		pixel,
 		file: resolvedFile,
 		baseUrl: url || DEFAULT_ROUTE_URL,
@@ -446,8 +486,8 @@ router.post('/send', (req, res) => {
 });
 
 // Get job status
-router.get('/jobs/:id', (req, res) => {
-	const job = jobs.get(req.params.id);
+router.get('/jobs/:id', async (req, res) => {
+	const job = await redisGetJob(req.params.id);
 	if (!job) return res.status(404).json({ error: 'Job not found' });
 	const clientId = req.get('x-client-id') || req.clientId;
 	if (!clientId || (job.clientId && job.clientId !== clientId)) {
@@ -457,17 +497,17 @@ router.get('/jobs/:id', (req, res) => {
 });
 
 // List jobs (recent first)
-router.get('/jobs', (req, res) => {
+router.get('/jobs', async (req, res) => {
 	const clientId = req.get('x-client-id') || req.clientId;
 	if (!clientId) return res.json([]);
-	let list = Array.from(jobs.values()).filter((j) => j.clientId === clientId);
-	list = list.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
+	const list = await redisListJobsByClient(clientId, 200);
 	res.json(list);
 });
 
 // Cancel a job
-router.post('/jobs/:id/cancel', (req, res) => {
-	const job = jobs.get(req.params.id);
+router.post('/jobs/:id/cancel', async (req, res) => {
+	const id = req.params.id;
+	const job = await redisGetJob(id);
 	if (!job) return res.status(404).json({ error: 'Job not found' });
 	const clientId = req.get('x-client-id') || req.clientId;
 	if (!clientId || (job.clientId && job.clientId !== clientId)) {
@@ -477,6 +517,7 @@ router.post('/jobs/:id/cancel', (req, res) => {
 		return res.status(400).json({ error: 'Job already finished' });
 	}
 	job.cancelled = true;
+	await redisUpdateJob(job);
 	res.json({ ok: true });
 });
 
