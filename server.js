@@ -247,6 +247,9 @@ function createJob({ pixel, file, baseUrl, chunkSize, reqDelay, chunkDelay, time
 
 const app = express();
 app.use(express.json());
+// Optional base path for mounting the entire app (UI + API) under a subpath
+const BASE_PATH = process.env.BASE_PATH || '/';
+const router = express.Router();
 // Assign or read per-user clientId via cookie for isolation
 function parseCookies(header) {
   const out = {};
@@ -273,20 +276,20 @@ function ensureClientId(req, res, next) {
 }
 
 app.use(ensureClientId);
-// Serve static UI
-app.use(express.static(path.resolve(process.cwd(), 'public')));
+// Serve static UI under base path
+router.use(express.static(path.resolve(process.cwd(), 'public')));
 
-app.get('/health', (_req, res) => {
+router.get('/health', (_req, res) => {
   res.json({ ok: true, serverTime: new Date().toISOString() });
 });
 
-// Root UI
-app.get('/', (_req, res) => {
+// Root UI under base path
+router.get('/', (_req, res) => {
   res.sendFile(path.resolve(process.cwd(), 'public', 'index.html'));
 });
 
 // List available country CSV files from countries/ directory
-app.get('/countries', async (_req, res) => {
+router.get('/countries', async (_req, res) => {
   try {
     const dir = path.resolve(process.cwd(), 'countries');
     const entries = await fs.readdir(dir, { withFileTypes: true });
@@ -316,7 +319,7 @@ app.get('/countries', async (_req, res) => {
 });
 
 // Create and start a new job
-app.post('/send', (req, res) => {
+router.post('/send', (req, res) => {
   const {
     pixel,
     file,
@@ -386,7 +389,7 @@ app.post('/send', (req, res) => {
 });
 
 // Get job status
-app.get('/jobs/:id', (req, res) => {
+router.get('/jobs/:id', (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: 'Job not found' });
   const clientId = req.get('x-client-id') || req.clientId;
@@ -397,7 +400,7 @@ app.get('/jobs/:id', (req, res) => {
 });
 
 // List jobs (recent first)
-app.get('/jobs', (req, res) => {
+router.get('/jobs', (req, res) => {
   const clientId = req.get('x-client-id') || req.clientId;
   if (!clientId) return res.json([]);
   let list = Array.from(jobs.values()).filter((j) => j.clientId === clientId);
@@ -406,7 +409,7 @@ app.get('/jobs', (req, res) => {
 });
 
 // Cancel a job
-app.post('/jobs/:id/cancel', (req, res) => {
+router.post('/jobs/:id/cancel', (req, res) => {
   const job = jobs.get(req.params.id);
   if (!job) return res.status(404).json({ error: 'Job not found' });
   const clientId = req.get('x-client-id') || req.clientId;
@@ -420,7 +423,11 @@ app.post('/jobs/:id/cancel', (req, res) => {
   res.json({ ok: true });
 });
 
+// Mount router at base path
+app.use(BASE_PATH, router);
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Pixel server listening on http://localhost:${PORT}`);
+const HOST = process.env.HOST || '0.0.0.0';
+app.listen(PORT, HOST, () => {
+  console.log(`Pixel server listening on http://${HOST}:${PORT}${BASE_PATH === '/' ? '' : BASE_PATH}`);
 });
