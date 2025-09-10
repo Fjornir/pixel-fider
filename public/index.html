@@ -3,24 +3,24 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Pixel Sender</title>
+  <title>Pixel Fider</title>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="bg-slate-50 text-slate-900">
   <div class="max-w-5xl mx-auto p-6">
     <div class="flex items-center justify-between mb-4">
-      <h1 class="text-2xl font-bold">Pixel Sender</h1>
+      <h1 class="text-2xl font-bold">Pixel Fider</h1>
       <div id="health" class="text-sm px-3 py-1 rounded-full bg-slate-200 text-slate-700">Проверка...</div>
     </div>
 
     <div id="error-banner" class="hidden mb-4 p-3 rounded border border-rose-300 bg-rose-50 text-rose-800"></div>
 
-    <p class="text-sm text-slate-600 mb-6">Отправляйте задания на обработку CSV-файлов. Для file можно указывать только имя без пути (например, <code>in</code> → <code>countries/in.csv</code>).</p>
+    <p class="text-sm text-slate-600 mb-6">Нужно обязательно добавить пиксель в сервис перед прикормкой! Отправляйте задания на прикормку пикселя. Страну нужно выбирать обязательно из выпадающего списка.</p>
 
     <form id="send-form" class="grid grid-cols-1 md:grid-cols-2 gap-4 bg-white p-4 rounded-lg shadow">
       <div>
         <label class="block text-sm font-medium mb-1">Pixel</label>
-        <input id="pixel" type="text" class="w-full rounded border px-3 py-2" placeholder="956404120009437" required />
+        <input id="pixel" type="text" inputmode="numeric" pattern="\\d*" class="w-full rounded border px-3 py-2" placeholder="956404120009437" required />
       </div>
       <div class="relative">
         <label class="block text-sm font-medium mb-1">Страна</label>
@@ -82,6 +82,13 @@
 
     // No need to manage clientId manually; backend sets a cookie
     function clientId() { return ''; }
+
+    // Enforce digits-only input for Pixel field
+    const pixelInput = document.getElementById('pixel');
+    pixelInput.addEventListener('input', () => {
+      const digits = pixelInput.value.replace(/\D+/g, '');
+      if (digits !== pixelInput.value) pixelInput.value = digits;
+    });
 
     // ---------- Health ----------
     async function updateHealth() {
@@ -211,54 +218,10 @@
       for (const input of form.querySelectorAll('input,button')) input.disabled = disabled;
     }
 
-    el('send-form').addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const submitBtn = e.target.querySelector('button[type="submit"]');
-      const originalHtml = submitBtn.innerHTML;
-      const spinner = '<svg class="animate-spin -ml-1 mr-2 h-5 w-5 text-white inline" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path></svg>';
-      submitBtn.disabled = true;
-      submitBtn.innerHTML = spinner + 'Создание...';
-
-      try {
-        const leadsCount = parseInt(el('leads-count').value) || 0;
-        const salesCount = parseInt(el('sales-count').value) || 0;
-        
-        if (leadsCount === 0 && salesCount === 0) {
-          throw new Error('Укажите количество лидов и/или продаж');
-        }
-
-        const payload = {
-          pixel: el('pixel').value.trim(),
-          file: el('file').value.trim(),
-          leadsCount,
-          salesCount
-        };
-        
-        const job = await createJob(payload);
-        // Запускаем опрос статуса в фоне, форма не блокируется
-        pollJob(job.id);
-        el('message').textContent = `Задача ${job.id} создана`;
-        el('message').className = 'text-sm text-green-600';
-        setTimeout(() => el('message').textContent = '', 3000);
-        // Разрешаем отправку новых задач сразу после создания
-        submitBtn.disabled = false;
-        submitBtn.innerHTML = originalHtml;
-      } catch (e) {
-        console.error('Error:', e);
-        showError('Ошибка: ' + e.message);
-      } finally {
-        // Ничего: кнопка восстанавливается в try при успехе, а при ошибке — здесь
-        if (submitBtn.disabled) {
-          submitBtn.disabled = false;
-          submitBtn.innerHTML = originalHtml;
-        }
-      }
-    });
-
-    el('refresh').addEventListener('click', () => renderJobs());
-
     // ---------- Country Autocomplete ----------
     let countries = [];
+    let selectedCountryCode = null; // last selected from list
+
     async function loadCountries() {
       try {
         const res = await withTimeout(fetch('countries'), 7000);
@@ -267,6 +230,12 @@
       } catch (e) {
         showError('Не удалось загрузить список стран: ' + e.message);
       }
+    }
+
+    function isValidCountryCode(code) {
+      if (!code) return false;
+      const c = String(code).trim().toLowerCase();
+      return countries.some(it => String(it.code || '').toLowerCase() === c);
     }
 
     function filterCountries(query) {
@@ -296,6 +265,7 @@
     }
 
     el('file').addEventListener('input', (e) => {
+      selectedCountryCode = null; // user started typing; reset selection
       const list = filterCountries(e.target.value);
       renderSuggest(list);
     });
@@ -306,6 +276,7 @@
         const btn = e.target.closest('#file-suggest button');
         const code = btn.dataset.code;
         el('file').value = code;
+        selectedCountryCode = code;
         box.classList.add('hidden');
         return;
       }
@@ -342,6 +313,61 @@
           alert(JSON.stringify(job, null, 2));
         } catch (e) {
           showError('Не удалось получить статус задачи: ' + e.message);
+        }
+      }
+    });
+
+    el('send-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const submitBtn = e.target.querySelector('button[type="submit"]');
+      const originalHtml = submitBtn.innerHTML;
+      const spinner = '<svg class="animate-spin -ml-1 mr-2 h-5 w-5 text-white inline" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path></svg>';
+      submitBtn.disabled = true;
+      submitBtn.innerHTML = spinner + 'Создание...';
+
+      try {
+        const leadsCount = parseInt(el('leads-count').value) || 0;
+        const salesCount = parseInt(el('sales-count').value) || 0;
+        
+        if (leadsCount === 0 && salesCount === 0) {
+          throw new Error('Укажите количество лидов и/или продаж');
+        }
+
+        const pixel = el('pixel').value.trim();
+        if (!/^\d+$/.test(pixel)) {
+          throw new Error('Pixel должен содержать только цифры');
+        }
+
+        const fileValue = el('file').value.trim();
+        // Validate: must be a known country code
+        if (!isValidCountryCode(fileValue)) {
+          throw new Error('Выберите страну из выпадающего списка');
+        }
+
+        const payload = {
+          pixel,
+          file: fileValue,
+          leadsCount,
+          salesCount
+        };
+        
+        const job = await createJob(payload);
+        // Запускаем опрос статуса в фоне, форма не блокируется
+        pollJob(job.id);
+        el('message').textContent = `Задача ${job.id} создана`;
+        el('message').className = 'text-sm text-green-600';
+        setTimeout(() => el('message').textContent = '', 3000);
+        // Разрешаем отправку новых задач сразу после создания
+        submitBtn.disabled = false;
+        submitBtn.innerHTML = originalHtml;
+      } catch (e) {
+        console.error('Error:', e);
+        showError('Ошибка: ' + e.message);
+      } finally {
+        // Ничего: кнопка восстанавливается в try при успехе, а при ошибке — здесь
+        if (submitBtn.disabled) {
+          submitBtn.disabled = false;
+          submitBtn.innerHTML = originalHtml;
         }
       }
     });

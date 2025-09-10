@@ -346,6 +346,9 @@ router.post('/send', (req, res) => {
   if (!pixel || !file) {
     return res.status(400).json({ error: 'Fields "pixel" and "file" are required' });
   }
+  if (!/^\d+$/.test(String(pixel))) {
+    return res.status(400).json({ error: 'Field "pixel" must contain digits only' });
+  }
 
   // Resolve file: if a bare name like "in" is provided, use countries/in.csv (under COUNTRIES_DIR)
   const resolveFilePath = (input) => {
