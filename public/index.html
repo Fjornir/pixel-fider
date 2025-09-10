@@ -1,0 +1,353 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Pixel Sender</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-50 text-slate-900">
+  <div class="max-w-5xl mx-auto p-6">
+    <div class="flex items-center justify-between mb-4">
+      <h1 class="text-2xl font-bold">Pixel Sender</h1>
+      <div id="health" class="text-sm px-3 py-1 rounded-full bg-slate-200 text-slate-700">Проверка...</div>
+    </div>
+
+    <div id="error-banner" class="hidden mb-4 p-3 rounded border border-rose-300 bg-rose-50 text-rose-800"></div>
+
+    <p class="text-sm text-slate-600 mb-6">Отправляйте задания на обработку CSV-файлов. Для file можно указывать только имя без пути (например, <code>in</code> → <code>countries/in.csv</code>).</p>
+
+    <form id="send-form" class="grid grid-cols-1 md:grid-cols-2 gap-4 bg-white p-4 rounded-lg shadow">
+      <div>
+        <label class="block text-sm font-medium mb-1">Pixel</label>
+        <input id="pixel" type="text" class="w-full rounded border px-3 py-2" placeholder="956404120009437" required />
+      </div>
+      <div class="relative">
+        <label class="block text-sm font-medium mb-1">Страна</label>
+        <input id="file" type="text" class="w-full rounded border px-3 py-2" placeholder="in или страна (например, Индия)" autocomplete="off" required />
+        <div id="file-suggest" class="absolute z-10 mt-1 w-full bg-white border rounded shadow hidden max-h-60 overflow-auto"></div>
+      </div>
+      <div>
+        <label class="block text-sm font-medium mb-1">Количество лидов (Реги)</label>
+        <input id="leads-count" type="number" min="0" value="0" class="w-full rounded border px-3 py-2" required />
+      </div>
+      <div>
+        <label class="block text-sm font-medium mb-1">Количество продаж (Депы)</label>
+        <input id="sales-count" type="number" min="0" value="0" class="w-full rounded border px-3 py-2" required />
+      </div>
+      <div class="md:col-span-2 flex items-end gap-3">
+        <button class="px-4 py-2 rounded bg-blue-600 text-white hover:bg-blue-700" type="submit">Создать задачу</button>
+        <button id="refresh" class="px-4 py-2 rounded bg-slate-200 hover:bg-slate-300" type="button">Обновить список</button>
+        <span id="message" class="text-sm text-slate-600"></span>
+      </div>
+    </form>
+
+    <div class="mt-8">
+      <h2 class="text-xl font-semibold mb-3">Задачи</h2>
+      <div class="overflow-x-auto bg-white rounded-lg shadow">
+        <table class="min-w-full text-sm">
+          <thead class="bg-slate-100">
+            <tr>
+              <th class="px-4 py-2 text-left">ID</th>
+              <th class="px-4 py-2 text-left">Статус</th>
+              <th class="px-4 py-2 text-left">Прогресс</th>
+              <th class="px-4 py-2 text-left">%</th>
+              <th class="px-4 py-2 text-left">Pixel</th>
+              <th class="px-4 py-2 text-left">Действия</th>
+            </tr>
+          </thead>
+          <tbody id="jobs-body"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const el = (id) => document.getElementById(id);
+
+    // ---------- Helpers ----------
+    function showError(msg) {
+      const box = el('error-banner');
+      box.textContent = msg;
+      box.classList.remove('hidden');
+      // auto-hide after 6s
+      clearTimeout(showError._t);
+      showError._t = setTimeout(() => box.classList.add('hidden'), 6000);
+    }
+
+    function withTimeout(promise, ms = 5000) {
+      const t = new Promise((_, rej) => setTimeout(() => rej(new Error(`Timeout ${ms}ms`)), ms));
+      return Promise.race([promise, t]);
+    }
+
+    // No need to manage clientId manually; backend sets a cookie
+    function clientId() { return ''; }
+
+    // ---------- Health ----------
+    async function updateHealth() {
+      const badge = el('health');
+      try {
+        const res = await withTimeout(fetch('/health'), 3000);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        badge.textContent = 'Сервер: OK';
+        badge.className = 'text-sm px-3 py-1 rounded-full bg-emerald-100 text-emerald-800 border border-emerald-300';
+      } catch (e) {
+        badge.textContent = 'Сервер: OFFLINE';
+        badge.className = 'text-sm px-3 py-1 rounded-full bg-rose-100 text-rose-800 border border-rose-300';
+      }
+    }
+    setInterval(updateHealth, 5000);
+    updateHealth();
+
+    // ---------- Jobs ----------
+    async function fetchJobs() {
+      try {
+        const res = await withTimeout(fetch('/jobs'), 7000);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        return res.json();
+      } catch (e) {
+        showError('Не удалось получить список задач: ' + e.message);
+        return [];
+      }
+    }
+
+    function percent(job) {
+      const total = job.progress.total || 0;
+      const processed = job.progress.sent + job.progress.errors;
+      if (total === 0) return 0;
+      return Math.floor(processed / total * 100);
+    }
+
+    function row(job) {
+      const tr = document.createElement('tr');
+      tr.className = 'border-t last:border-b';
+      tr.dataset.id = job.id;
+      tr.innerHTML = `
+        <td class="px-4 py-2 font-mono">${job.id.slice(0,8)}</td>
+        <td class="px-4 py-2 status">${job.status}</td>
+        <td class="px-4 py-2 progress">${job.progress.sent + job.progress.errors}/${job.progress.total} · ok:${job.progress.sent} · err:${job.progress.errors} · рег:${job.progress.leads || 0} · деп:${job.progress.sales || 0}</td>
+        <td class="px-4 py-2 percent">${percent(job)}%</td>
+        <td class="px-4 py-2">${String(job.pixel)}</td>
+        <td class="px-4 py-2 space-x-2 actions">
+          <button data-id="${job.id}" class="cancel px-3 py-1 rounded bg-rose-600 text-white hover:bg-rose-700 disabled:opacity-50" ${['completed','failed','completed_with_errors','cancelled'].includes(job.status) ? 'disabled' : ''}>Отменить</button>
+        </td>
+      `;
+      return tr;
+    }
+
+    function removeJobRow(jobId) {
+      const tr = document.querySelector(`tbody#jobs-body tr[data-id="${jobId}"]`);
+      if (tr) {
+        tr.style.transition = 'opacity 0.5s';
+        tr.style.opacity = '0';
+        setTimeout(() => tr.remove(), 500);
+      }
+    }
+
+    function updateRow(job) {
+      const tr = document.querySelector(`tbody#jobs-body tr[data-id="${job.id}"]`);
+      if (!tr) return; // not rendered yet
+      const finished = ['completed','failed','completed_with_errors','cancelled'].includes(job.status);
+      tr.querySelector('.status').textContent = job.status;
+      tr.querySelector('.progress').textContent = `${job.progress.sent + job.progress.errors}/${job.progress.total} · ok:${job.progress.sent} · err:${job.progress.errors} · рег:${job.progress.leads || 0} · деп:${job.progress.sales || 0}`;
+      tr.querySelector('.percent').textContent = `${percent(job)}%`;
+      const cancelBtn = tr.querySelector('button.cancel');
+      if (cancelBtn) cancelBtn.disabled = finished;
+      
+      // Schedule removal if job is cancelled
+      if (job.status === 'cancelled') {
+        setTimeout(() => removeJobRow(job.id), 10000);
+      }
+    }
+
+    async function renderJobs() {
+      const jobs = await fetchJobs();
+      const body = el('jobs-body');
+      body.innerHTML = '';
+      for (const j of jobs) body.appendChild(row(j));
+    }
+
+    async function createJob(payload) {
+      try {
+        const res = await withTimeout(fetch('/send', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }), 15000);
+        if (!res.ok) {
+          let detail = '';
+          try { detail = await res.text(); } catch {}
+          throw new Error(`HTTP ${res.status} ${res.statusText} ${detail}`);
+        }
+        return res.json();
+      } catch (e) {
+        showError('Не удалось создать задачу: ' + e.message);
+        throw e;
+      }
+    }
+
+    async function pollJob(jobId, intervalMs = 1000) {
+      const isFinished = (s) => ['completed','failed','completed_with_errors','cancelled'].includes(s);
+      while (true) {
+        try {
+          const res = await withTimeout(fetch(`/jobs/${jobId}`, { headers: { 'x-client-id': clientId() } }), 7000);
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const job = await res.json();
+          // Render row if missing, else update
+          if (!document.querySelector(`tbody#jobs-body tr[data-id="${job.id}"]`)) {
+            const body = el('jobs-body');
+            body.prepend(row(job));
+          } else {
+            updateRow(job);
+          }
+          if (isFinished(job.status)) break;
+        } catch (e) {
+          // transient UI error, show banner and stop polling this job
+          showError('Проблема при обновлении статуса: ' + e.message);
+          break;
+        }
+        await new Promise(r => setTimeout(r, intervalMs));
+      }
+    }
+
+    function setFormDisabled(disabled) {
+      const form = el('send-form');
+      for (const input of form.querySelectorAll('input,button')) input.disabled = disabled;
+    }
+
+    el('send-form').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const submitBtn = e.target.querySelector('button[type="submit"]');
+      const originalHtml = submitBtn.innerHTML;
+      const spinner = '<svg class="animate-spin -ml-1 mr-2 h-5 w-5 text-white inline" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"></path></svg>';
+      submitBtn.disabled = true;
+      submitBtn.innerHTML = spinner + 'Создание...';
+
+      try {
+        const leadsCount = parseInt(el('leads-count').value) || 0;
+        const salesCount = parseInt(el('sales-count').value) || 0;
+        
+        if (leadsCount === 0 && salesCount === 0) {
+          throw new Error('Укажите количество лидов и/или продаж');
+        }
+
+        const payload = {
+          pixel: el('pixel').value.trim(),
+          file: el('file').value.trim(),
+          leadsCount,
+          salesCount
+        };
+        
+        const job = await createJob(payload);
+        // Запускаем опрос статуса в фоне, форма не блокируется
+        pollJob(job.id);
+        el('message').textContent = `Задача ${job.id} создана`;
+        el('message').className = 'text-sm text-green-600';
+        setTimeout(() => el('message').textContent = '', 3000);
+        // Разрешаем отправку новых задач сразу после создания
+        submitBtn.disabled = false;
+        submitBtn.innerHTML = originalHtml;
+      } catch (e) {
+        console.error('Error:', e);
+        showError('Ошибка: ' + e.message);
+      } finally {
+        // Ничего: кнопка восстанавливается в try при успехе, а при ошибке — здесь
+        if (submitBtn.disabled) {
+          submitBtn.disabled = false;
+          submitBtn.innerHTML = originalHtml;
+        }
+      }
+    });
+
+    el('refresh').addEventListener('click', () => renderJobs());
+
+    // ---------- Country Autocomplete ----------
+    let countries = [];
+    async function loadCountries() {
+      try {
+        const res = await withTimeout(fetch('/countries'), 7000);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        countries = await res.json();
+      } catch (e) {
+        showError('Не удалось загрузить список стран: ' + e.message);
+      }
+    }
+
+    function filterCountries(query) {
+      const q = (query || '').trim().toLowerCase();
+      if (!q) return countries.slice(0, 20);
+      return countries.filter(c => {
+        const code = (c.code || '').toLowerCase();
+        const name = (c.nameRu || '').toLowerCase();
+        return code.includes(q) || name.includes(q);
+      }).slice(0, 20);
+    }
+
+    function renderSuggest(list) {
+      const box = el('file-suggest');
+      if (!list.length) {
+        box.innerHTML = `<div class="px-3 py-2 text-slate-500">Гео не найдено</div>`;
+        box.classList.remove('hidden');
+        return;
+      }
+      box.innerHTML = list.map(item => `
+        <button type="button" data-code="${item.code}" class="w-full text-left px-3 py-2 hover:bg-slate-100 flex justify-between">
+          <span>${item.nameRu || ''}</span>
+          <span class="font-mono text-slate-600">${item.code}</span>
+        </button>
+      `).join('');
+      box.classList.remove('hidden');
+    }
+
+    el('file').addEventListener('input', (e) => {
+      const list = filterCountries(e.target.value);
+      renderSuggest(list);
+    });
+
+    document.addEventListener('click', (e) => {
+      const box = el('file-suggest');
+      if (e.target.closest('#file-suggest button')) {
+        const btn = e.target.closest('#file-suggest button');
+        const code = btn.dataset.code;
+        el('file').value = code;
+        box.classList.add('hidden');
+        return;
+      }
+      if (!e.target.closest('#file') && !e.target.closest('#file-suggest')) {
+        box.classList.add('hidden');
+      }
+    });
+
+    // Initial loads
+    loadCountries();
+
+    document.addEventListener('click', async (e) => {
+      const btn = e.target.closest('button');
+      if (!btn) return;
+      
+      if (btn.classList.contains('cancel')) {
+        const jobId = btn.dataset.id;
+        try {
+          const res = await withTimeout(fetch(`/jobs/${jobId}/cancel`, { method: 'POST' }), 5000);
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const job = await res.json();
+          updateRow(job);
+          // The updateRow function will handle the removal after 10 seconds for cancelled tasks
+        } catch (e) {
+          showError('Не удалось отменить задачу: ' + e.message);
+        }
+      }
+      if (btn.classList.contains('view')) {
+        const id = btn.dataset.id;
+        try {
+          const res = await withTimeout(fetch(`/jobs/${id}`), 7000);
+          if (!res.ok) throw new Error(`HTTP ${res.status}`);
+          const job = await res.json();
+          alert(JSON.stringify(job, null, 2));
+        } catch (e) {
+          showError('Не удалось получить статус задачи: ' + e.message);
+        }
+      }
+    });
+
+    renderJobs();
+    setInterval(renderJobs, 5000);
+  </script>
+</body>
+</html>

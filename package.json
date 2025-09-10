@@ -1,0 +1,20 @@
+{
+  "name": "pixel-fider",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Send GET requests from CSV in chunks and update the CSV by removing successful rows.",
+  "main": "send.js",
+  "scripts": {
+    "start": "node send.js",
+    "start:server": "node server.js",
+    "serve": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "csv-parse": "^5.5.6",
+    "csv-stringify": "^6.5.2",
+    "express": "^4.19.2"
+  }
+}
