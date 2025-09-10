@@ -31,9 +31,9 @@ setGlobalDispatcher(keepAliveAgent);
 // Default config
 const DEFAULT_ROUTE_URL = process.env.DEFAULT_ROUTE_URL || '';
 const DEFAULTS = {
-	chunkSize: 20,
-	reqDelay: 70,
-	chunkDelay: 0,
+	chunkSize: 10,
+	reqDelay: 100,
+	chunkDelay: 300,
 	timeout: 30_000,
 };
 
@@ -72,13 +72,19 @@ function mapStatus(statusDefault) {
 	return map[String(statusDefault ?? '').trim()] ?? 'unknown';
 }
 
+// ---- Redis helpers for jobs and cancellation ----
+function cancelKey(jobId) { return `job:${jobId}:cancelled`; }
+async function setCancelled(jobId) { await redis.set(cancelKey(jobId), '1'); }
+async function clearCancelled(jobId) { await redis.del(cancelKey(jobId)); }
+async function isCancelled(jobId) { return (await redis.get(cancelKey(jobId))) === '1'; }
+
 function buildUrl(baseUrl, pixel, row) {
 	const userAgent = encodeURIComponent(String(row['User Agent'] ?? ''));
 	const fbclid = row['Sub ID 7'];
 	const ip = row['IP'] ?? '';
 	const subid = row['Subid'] ?? '';
 	const country = row['\u0424\u043b\u0430\u0433 \u0441\u0442\u0440\u0430\u043d\u044b'] ?? row['Флаг страны'] ?? '';
-	const status = mapStatus(row['\u0421\u0442\u0430\u0442\u0443\u0441'] ?? row['Статус']);
+	const status = mapStatus(row['\u0421\u0442\u0430\u0441\u0442\u0443\u0441'] ?? row['Статус']);
 
 	const url =
 		`${baseUrl}?pixel=${encodeURIComponent(String(pixel))}` +
@@ -93,9 +99,15 @@ function buildUrl(baseUrl, pixel, row) {
 
 async function sendRequest({ baseUrl, pixel, row, index, reqDelay, timeout, progress, jobId }) {
 	try {
+		// Fast cancel check before doing anything
+		if (await isCancelled(jobId)) return null;
+
 		const url = buildUrl(baseUrl, pixel, row);
 		// Delay between requests
 		await sleep(reqDelay);
+
+		// Cancel after delay as well
+		if (await isCancelled(jobId)) return null;
 
 		return await withConcurrency(async () => {
 			const controller = new AbortController();
@@ -277,9 +289,8 @@ async function runJob(job) {
 	const sessionOpts = { baseUrl, pixel, reqDelay, timeout, progress: job.progress, jobId: id };
 
 	for (const chunk of chunks) {
-		// Reload cancellation flag from Redis before each chunk
-		const fresh = await redisGetJob(id);
-		if (fresh?.cancelled) {
+		// Fast cancel check from Redis before each chunk
+		if (await isCancelled(id)) {
 			job.cancelled = true;
 			job.status = 'cancelled';
 			job.finishedAt = new Date().toISOString();
@@ -298,6 +309,7 @@ async function runJob(job) {
 	job.status = job.error ? 'completed_with_errors' : 'completed';
 	job.finishedAt = new Date().toISOString();
 	await redisUpdateJob(job);
+	await clearCancelled(id);
 	console.log(`[job ${id}] ${job.status} | ok=${job.progress.sent}/${job.progress.total} errors=${job.progress.errors} leads=${job.progress.leads} sales=${job.progress.sales} | maxConcurrency=${MAX_CONCURRENCY} keepAliveConns=${KEEPALIVE_CONNECTIONS}`);
 }
 
@@ -518,6 +530,7 @@ router.post('/jobs/:id/cancel', async (req, res) => {
 	}
 	job.cancelled = true;
 	await redisUpdateJob(job);
+	await setCancelled(id);
 	res.json({ ok: true });
 });
 
