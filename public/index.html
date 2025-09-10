@@ -87,7 +87,7 @@
     async function updateHealth() {
       const badge = el('health');
       try {
-        const res = await withTimeout(fetch('/health'), 3000);
+        const res = await withTimeout(fetch('health'), 3000);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         badge.textContent = 'Сервер: OK';
         badge.className = 'text-sm px-3 py-1 rounded-full bg-emerald-100 text-emerald-800 border border-emerald-300';
@@ -102,7 +102,7 @@
     // ---------- Jobs ----------
     async function fetchJobs() {
       try {
-        const res = await withTimeout(fetch('/jobs'), 7000);
+        const res = await withTimeout(fetch('jobs'), 7000);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return res.json();
       } catch (e) {
@@ -169,7 +169,7 @@
 
     async function createJob(payload) {
       try {
-        const res = await withTimeout(fetch('/send', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }), 15000);
+        const res = await withTimeout(fetch('send', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) }), 15000);
         if (!res.ok) {
           let detail = '';
           try { detail = await res.text(); } catch {}
@@ -186,7 +186,7 @@
       const isFinished = (s) => ['completed','failed','completed_with_errors','cancelled'].includes(s);
       while (true) {
         try {
-          const res = await withTimeout(fetch(`/jobs/${jobId}`, { headers: { 'x-client-id': clientId() } }), 7000);
+          const res = await withTimeout(fetch(`jobs/${jobId}`, { headers: { 'x-client-id': clientId() } }), 7000);
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           const job = await res.json();
           // Render row if missing, else update
@@ -261,7 +261,7 @@
     let countries = [];
     async function loadCountries() {
       try {
-        const res = await withTimeout(fetch('/countries'), 7000);
+        const res = await withTimeout(fetch('countries'), 7000);
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         countries = await res.json();
       } catch (e) {
@@ -324,7 +324,7 @@
       if (btn.classList.contains('cancel')) {
         const jobId = btn.dataset.id;
         try {
-          const res = await withTimeout(fetch(`/jobs/${jobId}/cancel`, { method: 'POST' }), 5000);
+          const res = await withTimeout(fetch(`jobs/${jobId}/cancel`, { method: 'POST' }), 5000);
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           const job = await res.json();
           updateRow(job);
@@ -336,7 +336,7 @@
       if (btn.classList.contains('view')) {
         const id = btn.dataset.id;
         try {
-          const res = await withTimeout(fetch(`/jobs/${id}`), 7000);
+          const res = await withTimeout(fetch(`jobs/${id}`), 7000);
           if (!res.ok) throw new Error(`HTTP ${res.status}`);
           const job = await res.json();
           alert(JSON.stringify(job, null, 2));
