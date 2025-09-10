@@ -72,8 +72,6 @@ async function sendRequest({ baseUrl, pixel, row, index, reqDelay, timeout, prog
           if (statusKind === 'lead') progress.leads += 1;
           else if (statusKind === 'sale') progress.sales += 1;
         } catch {}
-        // Single-line success log for each send
-        console.log(`[job ${jobId}] OK ${progress.sent}/${progress.total} | HTTP ${response.status} | idx ${index} | ${url}`);
         return index;
       } else {
         let content = '';
@@ -203,6 +201,7 @@ async function runJob(job) {
     if (job.cancelled) {
       job.status = 'cancelled';
       job.finishedAt = new Date().toISOString();
+      console.log(`[job ${id}] cancelled | ok=${job.progress.sent}/${job.progress.total} errors=${job.progress.errors} leads=${job.progress.leads} sales=${job.progress.sales}`);
       return;
     }
     const results = await processChunk(sessionOpts, chunk);
@@ -214,6 +213,7 @@ async function runJob(job) {
 
   job.status = job.error ? 'completed_with_errors' : 'completed';
   job.finishedAt = new Date().toISOString();
+  console.log(`[job ${id}] ${job.status} | ok=${job.progress.sent}/${job.progress.total} errors=${job.progress.errors} leads=${job.progress.leads} sales=${job.progress.sales}`);
 }
 
 // In-memory job store
