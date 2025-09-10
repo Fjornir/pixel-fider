@@ -33,8 +33,8 @@ const DEFAULT_ROUTE_URL = process.env.DEFAULT_ROUTE_URL || '';
 const DEFAULTS = {
 	chunkSize: 10,
 	reqDelay: 100,
-	chunkDelay: 300,
-	timeout: 30_000,
+	chunkDelay: 500,
+	timeout: 50_000,
 };
 
 // Global concurrency limiter
