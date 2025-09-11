@@ -199,25 +199,51 @@
 
     async function pollJob(jobId, intervalMs = 1000) {
       const isFinished = (s) => ['completed','failed','completed_with_errors','cancelled'].includes(s);
-      while (true) {
-        try {
-          const res = await withTimeout(fetch(`jobs/${jobId}`, { headers: { 'x-client-id': clientId() } }), 7000);
-          if (!res.ok) throw new Error(`HTTP ${res.status}`);
-          const job = await res.json();
-          // Render row if missing, else update
-          if (!document.querySelector(`tbody#jobs-body tr[data-id="${job.id}"]`)) {
-            const body = el('jobs-body');
-            body.prepend(row(job));
-          } else {
-            updateRow(job);
-          }
-          if (isFinished(job.status)) break;
-        } catch (e) {
-          // transient UI error, show banner and stop polling this job
-          showError('Проблема при обновлении статуса: ' + e.message);
-          break;
+      try {
+        // Prefer SSE for instant updates
+        const es = new EventSource(`jobs/${jobId}/stream`);
+        es.onmessage = (ev) => {
+          try {
+            const job = JSON.parse(ev.data);
+            if (!document.querySelector(`tbody#jobs-body tr[data-id="${job.id}"]`)) {
+              const body = el('jobs-body');
+              body.prepend(row(job));
+            } else {
+              updateRow(job);
+            }
+            if (isFinished(job.status)) es.close();
+          } catch {}
+        };
+        es.onerror = () => {
+          // Fallback to polling if SSE fails
+          es.close();
+          legacyPoll();
+        };
+
+        function legacyPoll() {
+          (async function loop() {
+            while (true) {
+              try {
+                const res = await withTimeout(fetch(`jobs/${jobId}`), 7000);
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                const job = await res.json();
+                if (!document.querySelector(`tbody#jobs-body tr[data-id="${job.id}"]`)) {
+                  const body = el('jobs-body');
+                  body.prepend(row(job));
+                } else {
+                  updateRow(job);
+                }
+                if (isFinished(job.status)) break;
+              } catch (e) {
+                showError('Проблема при обновлении статуса: ' + e.message);
+                break;
+              }
+              await new Promise(r => setTimeout(r, intervalMs));
+            }
+          })();
         }
-        await new Promise(r => setTimeout(r, intervalMs));
+      } catch (e) {
+        showError('SSE отключён, используем опрос: ' + e.message);
       }
     }
 

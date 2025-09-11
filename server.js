@@ -11,6 +11,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Agent, setGlobalDispatcher } from 'undici';
 import Redis from 'ioredis';
+import { EventEmitter } from 'node:events';
 
 // Load env once at startup
 dotenv.config();
@@ -194,6 +195,8 @@ async function redisListJobsByClient(clientId, limit = 100) {
 }
 async function redisUpdateJob(job) {
 	await redis.set(`job:${job.id}`, JSON.stringify(job));
+	// Notify SSE listeners
+	notifyJobUpdate(job);
 }
 
 async function runJob(job) {
@@ -369,6 +372,20 @@ app.use(express.json());
 const BASE_PATH = process.env.BASE_PATH || '/pixel';
 const router = express.Router();
 
+// --- SSE infrastructure: per-job subscribers ---
+const sseClientsByJob = new Map(); // jobId -> Set<res>
+
+function notifyJobUpdate(job) {
+	try {
+		const clients = sseClientsByJob.get(job.id);
+		if (!clients || clients.size === 0) return;
+		const payload = `data: ${JSON.stringify(job)}\n\n`;
+		for (const res of clients) {
+			try { res.write(payload); } catch {}
+		}
+	} catch {}
+}
+
 // Resolve project directories independent of process.cwd()
 const __FILENAME = fileURLToPath(import.meta.url);
 const __DIRNAME = path.dirname(__FILENAME);
@@ -531,6 +548,44 @@ router.get('/jobs/:id', async (req, res) => {
 		return res.status(404).json({ error: 'Job not found' });
 	}
 	res.json(job);
+});
+
+// Server-Sent Events stream for a single job
+router.get('/jobs/:id/stream', async (req, res) => {
+	const job = await redisGetJob(req.params.id);
+	if (!job) return res.status(404).json({ error: 'Job not found' });
+	const clientId = req.get('x-client-id') || req.clientId;
+	if (!clientId || (job.clientId && job.clientId !== clientId)) {
+		return res.status(404).json({ error: 'Job not found' });
+	}
+
+	res.setHeader('Content-Type', 'text/event-stream');
+	res.setHeader('Cache-Control', 'no-cache');
+	res.setHeader('Connection', 'keep-alive');
+	res.flushHeaders?.();
+
+	// Send initial state immediately
+	res.write(`data: ${JSON.stringify(job)}\n\n`);
+
+	// Register client
+	let set = sseClientsByJob.get(job.id);
+	if (!set) { set = new Set(); sseClientsByJob.set(job.id, set); }
+	set.add(res);
+
+	// Heartbeat to keep connection alive (some proxies time out idle streams)
+	const heartbeat = setInterval(() => {
+		try { res.write(': ping\n\n'); } catch {}
+	}, 15000);
+
+	// Cleanup on close
+	req.on('close', () => {
+		clearInterval(heartbeat);
+		const clients = sseClientsByJob.get(job.id);
+		if (clients) {
+			clients.delete(res);
+			if (clients.size === 0) sseClientsByJob.delete(job.id);
+		}
+	});
 });
 
 // List jobs (recent first)
