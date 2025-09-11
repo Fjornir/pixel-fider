@@ -17,7 +17,7 @@ module.exports = {
         KEEPALIVE_CONNECTIONS: 30,
         // Redis и дефолты
         REDIS_URL: 'redis://127.0.0.1:6379/0',
-        DEFAULT_ROUTE_URL: '',
+        // Не задаём DEFAULT_ROUTE_URL здесь в dev, чтобы .env мог его подставить
         // TTL и дебаунс обновлений задач
         JOB_TTL_SECONDS: 60 * 60 * 24 * 3, // 3 дня
         CANCEL_TTL_SECONDS: 60 * 60 * 24,  // 1 день
@@ -29,6 +29,12 @@ module.exports = {
         // При продовом запуске обычно поднимаем параллелизм
         MAX_CONCURRENCY: 50,
         KEEPALIVE_CONNECTIONS: 50,
+        // ВАЖНО: выставляем значения из вашего .env, чтобы PM2 не перетирал их пустыми
+        DEFAULT_ROUTE_URL: 'http://91.210.164.25:3001/api/send',
+        COUNTRIES_DIR: '/var/www/pixel-fider/countries',
+        BASE_PATH: '/pixel',
+        PORT: 3000,
+        HOST: '0.0.0.0',
       },
     },
   ],

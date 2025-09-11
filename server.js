@@ -87,22 +87,28 @@ async function clearCancelled(jobId) { await redis.del(cancelKey(jobId)); }
 async function isCancelled(jobId) { return (await redis.get(cancelKey(jobId))) === '1'; }
 
 function buildUrl(baseUrl, pixel, row) {
-	const userAgent = encodeURIComponent(String(row['User Agent'] ?? ''));
-	const fbclid = row['Sub ID 7'];
-	const ip = row['IP'] ?? '';
-	const subid = row['Subid'] ?? '';
-	const country = row['\u0424\u043b\u0430\u0433 \u0441\u0442\u0440\u0430\u043d\u044b'] ?? row['Флаг страны'] ?? '';
-	const status = mapStatus(row['\u0421\u0442\u0430\u0441\u0442\u0443\u0441'] ?? row['Статус']);
+    // Validate base URL to avoid fetch errors like "Failed to parse URL from ?pixel=..."
+    if (!baseUrl || !/^https?:\/\//i.test(String(baseUrl))) {
+        throw new Error('Base URL is empty or not absolute (must start with http:// or https://)');
+    }
 
-	const url =
-		`${baseUrl}?pixel=${encodeURIComponent(String(pixel))}` +
-		`&fbclid=${fbclid}` +
-		`&ip=${ip}` +
-		`&subid=${subid}` +
-		`&user_agent=${userAgent}` +
-		`&status=${status}` +
-		`&country=${country}`;
-	return url;
+    const userAgent = encodeURIComponent(String(row['User Agent'] ?? ''));
+    const fbclid = row['Sub ID 7'];
+    const ip = row['IP'] ?? '';
+    const subid = row['Subid'] ?? '';
+    const country = row['\u0424\u043b\u0430\u0433 \u0441\u0442\u0440\u0430\u043d\u044b'] ?? row['Флаг страны'] ?? '';
+    const status = mapStatus(row['\u0421\u0442\u0430\u0441\u0442\u0443\u0441'] ?? row['Статус']);
+
+    const sep = String(baseUrl).includes('?') ? '&' : '?';
+    const url =
+        `${baseUrl}${sep}pixel=${encodeURIComponent(String(pixel))}` +
+        `&fbclid=${fbclid}` +
+        `&ip=${ip}` +
+        `&subid=${subid}` +
+        `&user_agent=${userAgent}` +
+        `&status=${status}` +
+        `&country=${country}`;
+    return url;
 }
 
 async function sendRequest({ baseUrl, pixel, row, index, reqDelay, reqTimeout, progress, jobId }) {
@@ -525,6 +531,14 @@ router.post('/send', async (req, res) => {
 		return res.status(400).json({ error: 'Field "pixel" must contain digits only' });
 	}
 
+	// Validate base URL early to avoid runtime fetch errors
+	const effectiveBaseUrl = String(url || DEFAULT_ROUTE_URL || '').trim();
+	if (!/^https?:\/\//i.test(effectiveBaseUrl)) {
+		return res.status(400).json({
+			error: 'Field "url" is required and must start with http:// or https:// (or set DEFAULT_ROUTE_URL env)'
+		});
+	}
+
 	// Resolve file: if a bare name like "in" is provided, use countries/in.csv (under COUNTRIES_DIR)
 	const resolveFilePath = (input) => {
 		try {
@@ -562,7 +576,7 @@ router.post('/send', async (req, res) => {
 	const job = await createJob({
 		pixel,
 		file: resolvedFile,
-		baseUrl: url || DEFAULT_ROUTE_URL,
+		baseUrl: effectiveBaseUrl,
 		chunkSize: Number(chunkSize),
 		reqDelay: Number(reqDelay),
 		chunkDelay: Number(chunkDelay),
