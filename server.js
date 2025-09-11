@@ -11,7 +11,6 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Agent, setGlobalDispatcher } from 'undici';
 import Redis from 'ioredis';
-import { EventEmitter } from 'node:events';
 
 // Load env once at startup
 dotenv.config();
@@ -27,9 +26,15 @@ const DEFAULTS = {
 	reqDelay: 100,            // задержка между запросами (мс)
 	chunkDelay: 500,          // задержка между пачками (мс)
 	reqTimeout: 30_000,       // таймаут на один запрос (мс)
-	sessionTimeout: 3_600_000, // общий таймаут сессии (мс)
 	connLimit: 10             // максимальное число соединений (параллельных запросов)
 };
+
+// TTLs for Redis entries
+const JOB_TTL_SECONDS = Number(process.env.JOB_TTL_SECONDS) > 0 ? Number(process.env.JOB_TTL_SECONDS) : 60 * 60 * 24 * 3; // 3 days
+const CANCEL_TTL_SECONDS = Number(process.env.CANCEL_TTL_SECONDS) > 0 ? Number(process.env.CANCEL_TTL_SECONDS) : 60 * 60 * 24; // 1 day
+// Debounce settings for Redis job updates
+const JOB_UPDATE_DEBOUNCE_MS = Number(process.env.JOB_UPDATE_DEBOUNCE_MS) >= 0 ? Number(process.env.JOB_UPDATE_DEBOUNCE_MS) : 300;
+const JOB_UPDATE_MAX_MS = Number(process.env.JOB_UPDATE_MAX_MS) > 0 ? Number(process.env.JOB_UPDATE_MAX_MS) : 2000;
 
 // HTTP keep-alive for better throughput
 const KEEPALIVE_CONNECTIONS = Number(process.env.KEEPALIVE_CONNECTIONS) || DEFAULTS.connLimit;
@@ -77,7 +82,7 @@ function mapStatus(statusDefault) {
 
 // ---- Redis helpers for jobs and cancellation ----
 function cancelKey(jobId) { return `job:${jobId}:cancelled`; }
-async function setCancelled(jobId) { await redis.set(cancelKey(jobId), '1'); }
+async function setCancelled(jobId) { await redis.set(cancelKey(jobId), '1', 'EX', CANCEL_TTL_SECONDS); }
 async function clearCancelled(jobId) { await redis.del(cancelKey(jobId)); }
 async function isCancelled(jobId) { return (await redis.get(cancelKey(jobId))) === '1'; }
 
@@ -121,7 +126,9 @@ async function sendRequest({ baseUrl, pixel, row, index, reqDelay, reqTimeout, p
 
 				if (response.ok) {
 					progress.sent += 1;
+					// cap logs to avoid unbounded growth
 					progress.logs.push({ level: 'info', msg: `OK ${progress.sent}/${progress.total}`, url, status: response.status });
+					if (progress.logs.length > 1000) progress.logs.splice(0, progress.logs.length - 1000);
 					// Increment per-type counters (lead/sale)
 					try {
 						const statusKind = mapStatus(row['\u0421\u0442\u0430\u0441\u0442\u0443\u0441'] ?? row['Статус']);
@@ -134,6 +141,7 @@ async function sendRequest({ baseUrl, pixel, row, index, reqDelay, reqTimeout, p
 					try { content = await response.text(); } catch {}
 					progress.errors += 1;
 					progress.logs.push({ level: 'error', msg: `HTTP ${response.status}`, url, content });
+					if (progress.logs.length > 1000) progress.logs.splice(0, progress.logs.length - 1000);
 					// Log only errors to console with compact, single-line output
 					console.error(`[job ${jobId}] HTTP ${response.status} | ${url} | ${content?.slice(0,200) ?? ''}`);
 					return null;
@@ -144,9 +152,11 @@ async function sendRequest({ baseUrl, pixel, row, index, reqDelay, reqTimeout, p
 				const isAbort = (err && (err.name === 'AbortError' || String(err).includes('AbortError')));
 				if (isAbort) {
 					progress.logs.push({ level: 'error', msg: `Timeout after ${reqTimeout}ms`, url });
+					if (progress.logs.length > 1000) progress.logs.splice(0, progress.logs.length - 1000);
 					console.error(`[job ${jobId}] Timeout after ${reqTimeout}ms | ${url}`);
 				} else {
 					progress.logs.push({ level: 'error', msg: `Fetch error: ${String(err)}` });
+					if (progress.logs.length > 1000) progress.logs.splice(0, progress.logs.length - 1000);
 					console.error(`[job ${jobId}] Fetch error: ${String(err)}`);
 				}
 				return null;
@@ -173,7 +183,7 @@ function chunkArray(arr, size) {
 
 // Redis helpers for jobs storage
 async function redisSaveJob(job) {
-	await redis.set(`job:${job.id}`, JSON.stringify(job));
+	await redis.set(`job:${job.id}`, JSON.stringify(job), 'EX', JOB_TTL_SECONDS);
 	if (job.clientId) {
 		await redis.zadd(`jobs:byClient:${job.clientId}`, Date.parse(job.createdAt) || Date.now(), job.id);
 	}
@@ -194,19 +204,48 @@ async function redisListJobsByClient(clientId, limit = 100) {
 		.sort((a, b) => (a.createdAt < b.createdAt ? 1 : -1));
 }
 async function redisUpdateJob(job) {
-	await redis.set(`job:${job.id}`, JSON.stringify(job));
+	await redis.set(`job:${job.id}`, JSON.stringify(job), 'EX', JOB_TTL_SECONDS);
 	// Notify SSE listeners
 	notifyJobUpdate(job);
+}
+
+// Debounced/batched updater
+const pendingJobUpdates = new Map(); // jobId -> { timer, firstAt, snapshot }
+async function flushPendingJobUpdate(jobId) {
+	const entry = pendingJobUpdates.get(jobId);
+	if (!entry) return;
+	pendingJobUpdates.delete(jobId);
+	try { await redisUpdateJob(entry.snapshot); } catch {}
+}
+function redisUpdateJobBatched(job, { force = false } = {}) {
+	if (force || JOB_UPDATE_DEBOUNCE_MS <= 0) {
+		pendingJobUpdates.delete(job.id);
+		return redisUpdateJob(job);
+	}
+	const now = Date.now();
+	let entry = pendingJobUpdates.get(job.id);
+	if (!entry) {
+		entry = { timer: null, firstAt: now, snapshot: job };
+	} else {
+		if (entry.timer) clearTimeout(entry.timer);
+		entry.snapshot = job;
+	}
+	const maxDelayLeft = Math.max(0, (entry.firstAt + JOB_UPDATE_MAX_MS) - now);
+	const delay = Math.min(JOB_UPDATE_DEBOUNCE_MS, maxDelayLeft);
+	entry.timer = setTimeout(() => {
+		flushPendingJobUpdate(job.id);
+	}, delay);
+	pendingJobUpdates.set(job.id, entry);
 }
 
 async function runJob(job) {
 	const { id, pixel, file, baseUrl, chunkSize, reqDelay, chunkDelay, reqTimeout, sessionTimeout } = job;
 	job.status = 'running';
 	job.startedAt = new Date().toISOString();
-	await redisUpdateJob(job);
+	await redisUpdateJobBatched(job, { force: true });
 
 	const startedAtMs = Date.now();
-	const sessionDeadline = startedAtMs + Number(sessionTimeout || DEFAULTS.sessionTimeout);
+	const sessionDeadline = (Number(sessionTimeout) > 0) ? (startedAtMs + Number(sessionTimeout)) : null;
 
 	console.log(`Attempting to read file: ${file}`);
 	
@@ -221,7 +260,7 @@ async function runJob(job) {
 		job.status = 'failed';
 		job.error = errorMsg;
 		job.finishedAt = new Date().toISOString();
-		await redisUpdateJob(job);
+		await redisUpdateJobBatched(job, { force: true });
 		return;
 	}
 
@@ -268,7 +307,7 @@ async function runJob(job) {
 		job.status = 'failed';
 		job.error = `Ошибка парсинга CSV: ${e}`;
 		job.finishedAt = new Date().toISOString();
-		await redisUpdateJob(job);
+		await redisUpdateJobBatched(job, { force: true });
 		return;
 	}
 
@@ -288,7 +327,7 @@ async function runJob(job) {
 	}
 
 	job.progress.total = records.length;
-	await redisUpdateJob(job);
+	await redisUpdateJobBatched(job);
 
 	const indexed = records.map((row, index) => ({ row, index }));
 	const chunks = chunkArray(indexed, chunkSize);
@@ -297,13 +336,13 @@ async function runJob(job) {
 	const sessionOpts = { baseUrl, pixel, reqDelay, reqTimeout, progress: job.progress, jobId: id };
 
 	for (const chunk of chunks) {
-		// Session timeout check
-		if (Date.now() > sessionDeadline) {
+		// Session timeout check (only if provided)
+		if (sessionDeadline && Date.now() > sessionDeadline) {
 			job.status = 'failed';
-			job.error = `Session timeout after ${Number(sessionTimeout || DEFAULTS.sessionTimeout)}ms`;
+			job.error = `Session timeout after ${Number(sessionTimeout)}ms`;
 			job.finishedAt = new Date().toISOString();
 			await setCancelled(id);
-			await redisUpdateJob(job);
+			await redisUpdateJobBatched(job, { force: true });
 			console.error(`[job ${id}] session timeout`);
 			return;
 		}
@@ -312,13 +351,13 @@ async function runJob(job) {
 			job.cancelled = true;
 			job.status = 'cancelled';
 			job.finishedAt = new Date().toISOString();
-			await redisUpdateJob(job);
+			await redisUpdateJobBatched(job, { force: true });
 			console.log(`[job ${id}] cancelled | ok=${job.progress.sent}/${job.progress.total} errors=${job.progress.errors} leads=${job.progress.leads} sales=${job.progress.sales}`);
 			return;
 		}
 		const results = await processChunk(sessionOpts, chunk);
 		for (const idx of results) if (idx !== null && idx !== undefined) successfulIndices.push(idx);
-		await redisUpdateJob(job);
+		await redisUpdateJobBatched(job);
 		await sleep(chunkDelay);
 	}
 
@@ -326,7 +365,7 @@ async function runJob(job) {
 
 	job.status = job.error ? 'completed_with_errors' : 'completed';
 	job.finishedAt = new Date().toISOString();
-	await redisUpdateJob(job);
+	await redisUpdateJobBatched(job, { force: true });
 	await clearCancelled(id);
 	console.log(`[job ${id}] ${job.status} | ok=${job.progress.sent}/${job.progress.total} errors=${job.progress.errors} leads=${job.progress.leads} sales=${job.progress.sales} | maxConcurrency=${MAX_CONCURRENCY} keepAliveConns=${KEEPALIVE_CONNECTIONS}`);
 }
@@ -347,7 +386,7 @@ async function createJob({ pixel, file, baseUrl, chunkSize, reqDelay, chunkDelay
 		reqDelay,
 		chunkDelay,
 		reqTimeout,
-		sessionTimeout,
+		sessionTimeout: (Number(sessionTimeout) > 0 ? Number(sessionTimeout) : null),
 		connLimit,
 		progress: { sent: 0, total: 0, errors: 0, leads: 0, sales: 0, logs: [] },
 		error: null,
@@ -361,7 +400,7 @@ async function createJob({ pixel, file, baseUrl, chunkSize, reqDelay, chunkDelay
 		job.status = 'failed';
 		job.error = `Непредвиденная ошибка: ${e}`;
 		job.finishedAt = new Date().toISOString();
-		await redisUpdateJob(job);
+		await redisUpdateJobBatched(job, { force: true });
 	});
 	return job;
 }
@@ -468,7 +507,7 @@ router.post('/send', async (req, res) => {
 		reqDelay = DEFAULTS.reqDelay,
 		chunkDelay = DEFAULTS.chunkDelay,
 		reqTimeout = DEFAULTS.reqTimeout,
-		sessionTimeout = DEFAULTS.sessionTimeout,
+		sessionTimeout,
 		connLimit = DEFAULTS.connLimit,
 		leadsCount = 0,
 		salesCount = 0,
@@ -528,7 +567,7 @@ router.post('/send', async (req, res) => {
 		reqDelay: Number(reqDelay),
 		chunkDelay: Number(chunkDelay),
 		reqTimeout: Number(effectiveReqTimeout),
-		sessionTimeout: Number(sessionTimeout) || DEFAULTS.sessionTimeout,
+		sessionTimeout: Number(sessionTimeout) > 0 ? Number(sessionTimeout) : null,
 		connLimit: Number(connLimit) || DEFAULTS.connLimit,
 		leadsCount: Number(leadsCount) || 0,
 		salesCount: Number(salesCount) || 0,
@@ -609,9 +648,9 @@ router.post('/jobs/:id/cancel', async (req, res) => {
 		return res.status(400).json({ error: 'Job already finished' });
 	}
 	job.cancelled = true;
-	await redisUpdateJob(job);
+	await redisUpdateJobBatched(job, { force: true });
 	await setCancelled(id);
-	res.json({ ok: true });
+	res.json(job);
 });
 
 // Mount router at base path
