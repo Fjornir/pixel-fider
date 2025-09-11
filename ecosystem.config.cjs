@@ -23,6 +23,8 @@ module.exports = {
         CANCEL_TTL_SECONDS: 60 * 60 * 24,  // 1 день
         JOB_UPDATE_DEBOUNCE_MS: 300,
         JOB_UPDATE_MAX_MS: 2000,
+        // Логировать каждую успешную отправку в dev
+        SUCCESS_LOG_EVERY: 1,
       },
       env_production: {
         NODE_ENV: 'production',
@@ -35,6 +37,14 @@ module.exports = {
         BASE_PATH: '/pixel',
         PORT: 3000,
         HOST: '0.0.0.0',
+        // Redis и TTL/дебаунс обновлений задач
+        REDIS_URL: 'redis://127.0.0.1:6379/0',
+        JOB_TTL_SECONDS: 60 * 60 * 24 * 3, // 3 дня хранить задачи
+        CANCEL_TTL_SECONDS: 60 * 60 * 24,  // 1 день хранить флаг отмены
+        JOB_UPDATE_DEBOUNCE_MS: 300,
+        JOB_UPDATE_MAX_MS: 2000,
+        // Логировать каждую успешную отправку в проде
+        SUCCESS_LOG_EVERY: 1,
       },
     },
   ],
