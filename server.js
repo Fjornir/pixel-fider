@@ -47,6 +47,8 @@ setGlobalDispatcher(keepAliveAgent);
 
 // Global concurrency limiter
 const MAX_CONCURRENCY = Math.max(1, Number(process.env.MAX_CONCURRENCY) || DEFAULTS.connLimit);
+// How often to emit a short success log to stdout (to avoid log spam)
+const SUCCESS_LOG_EVERY = Math.max(1, Number(process.env.SUCCESS_LOG_EVERY) || 50);
 let concurrencyInUse = 0;
 const concurrencyWaiters = [];
 async function acquireConcurrency() {
@@ -141,6 +143,12 @@ async function sendRequest({ baseUrl, pixel, row, index, reqDelay, reqTimeout, p
 						if (statusKind === 'lead') progress.leads += 1;
 						else if (statusKind === 'sale') progress.sales += 1;
 					} catch {}
+					// Emit concise success log every N requests so operators can see workers are active
+                    if (progress.sent % SUCCESS_LOG_EVERY === 0) {
+                        try {
+                            console.log(`[job ${jobId}] ok=${progress.sent}/${progress.total} errors=${progress.errors} pid=${process.pid}`);
+                        } catch {}
+                    }
 					return index;
 				} else {
 					let content = '';
