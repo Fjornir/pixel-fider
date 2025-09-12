@@ -11,6 +11,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Agent, setGlobalDispatcher } from 'undici';
 import Redis from 'ioredis';
+import { MongoClient } from 'mongodb';
 
 // Load env once at startup
 dotenv.config();
@@ -80,6 +81,39 @@ function sleep(ms) {
 function mapStatus(statusDefault) {
 	const map = { lead: 'lead', sale: 'sale', rejected: 'install' };
 	return map[String(statusDefault ?? '').trim()] ?? 'unknown';
+}
+
+// ---- MongoDB (for pixel validation) ----
+const MONGO_URL = process.env.MONGO_URL || process.env.DB_URL || '';
+let mongoClient = null;
+let mongoDb = null; // Use default DB from connection string
+async function getMongoDb() {
+    if (!MONGO_URL) {
+        throw new Error('DB connection string not configured (set MONGO_URL in env/PM2 ecosystem config)');
+    }
+    if (mongoDb && mongoClient) return mongoDb;
+    mongoClient = new MongoClient(MONGO_URL, {
+        // modern unified topology by default in v5
+        maxPoolSize: 10,
+    });
+    await mongoClient.connect();
+    mongoDb = mongoClient.db();
+    return mongoDb;
+}
+async function pixelExists(pixel) {
+    try {
+        const db = await getMongoDb();
+        const col = db.collection('pixel2');
+        const numeric = Number(pixel);
+        const query = Number.isFinite(numeric)
+            ? { $or: [ { number: pixel }, { number: numeric } ] }
+            : { number: pixel };
+        const doc = await col.findOne(query, { projection: { _id: 1 } });
+        return !!doc;
+    } catch (e) {
+        // Surface errors to the caller for proper 5xx response
+        throw e;
+    }
 }
 
 // ---- Redis helpers for jobs and cancellation ----
@@ -479,131 +513,142 @@ router.get('/health', (_req, res) => {
 
 // Root UI under base path
 router.get('/', (_req, res) => {
-	res.sendFile(path.resolve(process.cwd(), 'public', 'index.html'));
+    res.sendFile(path.resolve(process.cwd(), 'public', 'index.html'));
 });
 
 // List available country CSV files from countries/ directory
 router.get('/countries', async (_req, res) => {
-	try {
-		const entries = await fs.readdir(COUNTRIES_DIR, { withFileTypes: true });
-		const items = entries
-			.filter((e) => e.isFile() && e.name.toLowerCase().endsWith('.csv'))
-			.map((e) => {
-				const file = e.name;
-				const code = file.replace(/\.csv$/i, '');
-				return { code, file: path.join('countries', file) };
-			});
+    try {
+        const entries = await fs.readdir(COUNTRIES_DIR, { withFileTypes: true });
+        const items = entries
+            .filter((e) => e.isFile() && e.name.toLowerCase().endsWith('.csv'))
+            .map((e) => {
+                const file = e.name;
+                const code = file.replace(/\.csv$/i, '');
+                return { code, file: path.join('countries', file) };
+            });
 
-		// Attach Russian display name if possible
-		let display;
-		try {
-			display = new Intl.DisplayNames(['ru'], { type: 'region' });
-		} catch {
-			display = null;
-		}
-		const result = items.map((it) => {
-			const nameRu = display ? (display.of(it.code.toUpperCase()) || null) : null;
-			return { ...it, nameRu };
-		});
-		res.json(result);
-	} catch (e) {
-		res.status(500).json({ error: String(e) });
-	}
+        // Attach Russian display name if possible
+        let display;
+        try {
+            display = new Intl.DisplayNames(['ru'], { type: 'region' });
+        } catch {
+            display = null;
+        }
+        const result = items.map((it) => {
+            const nameRu = display ? (display.of(it.code.toUpperCase()) || null) : null;
+            return { ...it, nameRu };
+        });
+        res.json(result);
+    } catch (e) {
+        res.status(500).json({ error: String(e) });
+    }
 });
 
 // Create and start a new job
 router.post('/send', async (req, res) => {
-	const {
-		pixel,
-		file,
-		url,
-		chunkSize = DEFAULTS.chunkSize,
-		reqDelay = DEFAULTS.reqDelay,
-		chunkDelay = DEFAULTS.chunkDelay,
-		reqTimeout = DEFAULTS.reqTimeout,
-		sessionTimeout,
-		connLimit = DEFAULTS.connLimit,
-		leadsCount = 0,
-		salesCount = 0,
-		clientId: clientIdBody = null,
-		// Backward compat: allow "timeout" to set reqTimeout if provided
-		timeout,
-	} = req.body || {};
+    const {
+        pixel,
+        file,
+        url,
+        chunkSize = DEFAULTS.chunkSize,
+        reqDelay = DEFAULTS.reqDelay,
+        chunkDelay = DEFAULTS.chunkDelay,
+        reqTimeout = DEFAULTS.reqTimeout,
+        sessionTimeout,
+        connLimit = DEFAULTS.connLimit,
+        leadsCount = 0,
+        salesCount = 0,
+        clientId: clientIdBody = null,
+        // Backward compat: allow "timeout" to set reqTimeout if provided
+        timeout,
+    } = req.body || {};
 
-	const effectiveReqTimeout = Number(timeout) || Number(reqTimeout) || DEFAULTS.reqTimeout;
+    const effectiveReqTimeout = Number(timeout) || Number(reqTimeout) || DEFAULTS.reqTimeout;
 
-	if (!pixel || !file) {
-		return res.status(400).json({ error: 'Fields "pixel" and "file" are required' });
-	}
-	if (!/^\d+$/.test(String(pixel))) {
-		return res.status(400).json({ error: 'Field "pixel" must contain digits only' });
-	}
+    if (!pixel || !file) {
+        return res.status(400).json({ error: 'Fields "pixel" and "file" are required' });
+    }
+    if (!/^\d+$/.test(String(pixel))) {
+        return res.status(400).json({ error: 'Field "pixel" must contain digits only' });
+    }
 
-	// Validate base URL early to avoid runtime fetch errors
-	const effectiveBaseUrl = String(url || DEFAULT_ROUTE_URL || '').trim();
-	if (!/^https?:\/\//i.test(effectiveBaseUrl)) {
-		return res.status(400).json({
-			error: 'Field "url" is required and must start with http:// or https:// (or set DEFAULT_ROUTE_URL env)'
-		});
-	}
+    // Validate base URL early to avoid runtime fetch errors
+    const effectiveBaseUrl = String(url || DEFAULT_ROUTE_URL || '').trim();
+    if (!/^https?:\/\//i.test(effectiveBaseUrl)) {
+        return res.status(400).json({
+            error: 'Field "url" is required and must start with http:// or https:// (or set DEFAULT_ROUTE_URL env)'
+        });
+    }
 
-	// Resolve file: if a bare name like "in" is provided, use countries/in.csv (under COUNTRIES_DIR)
-	const resolveFilePath = (input) => {
-		try {
-			console.log('Resolving file path for input:', input);
-			const hasSeparator = /[\\/]/.test(input);
-			const hasCsvExt = input.toLowerCase().endsWith('.csv');
-			
-			let resolvedPath;
-			if (hasSeparator) {
-				// Treat as path (relative or absolute)
-				resolvedPath = path.resolve(input);
-			} else {
-				// No separator: treat as countries/<name>[.csv]
-				const baseName = hasCsvExt ? input : `${input}.csv`;
-				resolvedPath = path.resolve(COUNTRIES_DIR, baseName);
-			}
-			
-			console.log('Resolved path:', resolvedPath);
-			
-			// Verify file exists
-			if (!fsSync.existsSync(resolvedPath)) {
-				throw new Error(`File not found: ${resolvedPath}`);
-			}
-			
-			return resolvedPath;
-		} catch (error) {
-			console.error('Error resolving file path:', error);
-			throw error;
-		}
-	};
+    // Pixel validation against DB (collection: pixel2, field: number)
+    try {
+        const exists = await pixelExists(String(pixel));
+        if (!exists) {
+            return res.status(400).json({ error: 'Пиксель не найден в базе (коллекция pixel2, поле number). Добавьте пиксель в сервис и повторите.' });
+        }
+    } catch (e) {
+        console.error('DB validation error:', e);
+        return res.status(500).json({ error: `Ошибка проверки пикселя в БД: ${e?.message || e}` });
+    }
 
-	const resolvedFile = resolveFilePath(String(file));
+    // Resolve file: if a bare name like "in" is provided, use countries/in.csv (under COUNTRIES_DIR)
+    const resolveFilePath = (input) => {
+        try {
+            console.log('Resolving file path for input:', input);
+            const hasSeparator = /[\\/]/.test(input);
+            const hasCsvExt = input.toLowerCase().endsWith('.csv');
 
-	const clientIdHeader = req.get('x-client-id');
-	const job = await createJob({
-		pixel,
-		file: resolvedFile,
-		baseUrl: effectiveBaseUrl,
-		chunkSize: Number(chunkSize),
-		reqDelay: Number(reqDelay),
-		chunkDelay: Number(chunkDelay),
-		reqTimeout: Number(effectiveReqTimeout),
-		sessionTimeout: Number(sessionTimeout) > 0 ? Number(sessionTimeout) : null,
-		connLimit: Number(connLimit) || DEFAULTS.connLimit,
-		leadsCount: Number(leadsCount) || 0,
-		salesCount: Number(salesCount) || 0,
-		clientId: String(clientIdHeader || clientIdBody || req.clientId || ''),
-	});
+            let resolvedPath;
+            if (hasSeparator) {
+                // Treat as path (relative or absolute)
+                resolvedPath = path.resolve(input);
+            } else {
+                // No separator: treat as countries/<name>[.csv]
+                const baseName = hasCsvExt ? input : `${input}.csv`;
+                resolvedPath = path.resolve(COUNTRIES_DIR, baseName);
+            }
 
-	// Include both id and jobId for compatibility with UI expecting `id`
-	res.status(202).json({ id: job.id, jobId: job.id, status: job.status, file: resolvedFile, clientId: job.clientId });
+            console.log('Resolved path:', resolvedPath);
+
+            // Verify file exists
+            if (!fsSync.existsSync(resolvedPath)) {
+                throw new Error(`File not found: ${resolvedPath}`);
+            }
+
+            return resolvedPath;
+        } catch (error) {
+            console.error('Error resolving file path:', error);
+            throw error;
+        }
+    };
+
+    const resolvedFile = resolveFilePath(String(file));
+
+    const clientIdHeader = req.get('x-client-id');
+    const job = await createJob({
+        pixel,
+        file: resolvedFile,
+        baseUrl: effectiveBaseUrl,
+        chunkSize: Number(chunkSize),
+        reqDelay: Number(reqDelay),
+        chunkDelay: Number(chunkDelay),
+        reqTimeout: Number(effectiveReqTimeout),
+        sessionTimeout: Number(sessionTimeout) > 0 ? Number(sessionTimeout) : null,
+        connLimit: Number(connLimit) || DEFAULTS.connLimit,
+        leadsCount: Number(leadsCount) || 0,
+        salesCount: Number(salesCount) || 0,
+        clientId: String(clientIdHeader || clientIdBody || req.clientId || ''),
+    });
+
+    // Include both id and jobId for compatibility with UI expecting `id`
+    res.status(202).json({ id: job.id, jobId: job.id, status: job.status, file: resolvedFile, clientId: job.clientId });
 });
 
 // Get job status
 router.get('/jobs/:id', async (req, res) => {
-	const job = await redisGetJob(req.params.id);
-	if (!job) return res.status(404).json({ error: 'Job not found' });
+    const job = await redisGetJob(req.params.id);
+    // ... (rest of the code remains the same)
 	const clientId = req.get('x-client-id') || req.clientId;
 	if (!clientId || (job.clientId && job.clientId !== clientId)) {
 		return res.status(404).json({ error: 'Job not found' });
