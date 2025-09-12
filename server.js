@@ -585,7 +585,7 @@ router.post('/send', async (req, res) => {
     try {
         const exists = await pixelExists(String(pixel));
         if (!exists) {
-            return res.status(400).json({ error: 'Пиксель не найден в базе (коллекция pixel2, поле number). Добавьте пиксель в сервис и повторите.' });
+            return res.status(400).json({ error: 'Пиксель не найден в базе' });
         }
     } catch (e) {
         console.error('DB validation error:', e);

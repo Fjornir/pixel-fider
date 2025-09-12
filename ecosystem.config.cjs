@@ -45,7 +45,7 @@ module.exports = {
         JOB_UPDATE_MAX_MS: 2000,
         // Логировать каждую успешную отправку в проде
         SUCCESS_LOG_EVERY: 1,
-        MONGO_URL: 'mongodb://127.0.0.1:27017/pixel-fider',
+        MONGO_URL: '',
       },
     },
   ],
