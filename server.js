@@ -201,7 +201,7 @@ function buildUrl(baseUrl, pixel, row) {
     return url;
 }
 
-async function sendRequest({ baseUrl, pixel, row, index, reqDelay, reqTimeout, progress, jobId }) {
+async function sendRequest({ baseUrl, pixel, row, index, reqDelay, reqTimeout, progress, jobId, fireAndForget = false }) {
 	try {
 		// Fast cancel check before doing anything
 		if (await isCancelled(jobId)) return null;
@@ -219,59 +219,75 @@ async function sendRequest({ baseUrl, pixel, row, index, reqDelay, reqTimeout, p
 
 		return await withConcurrency(async () => {
 			const controller = new AbortController();
-			const timeoutId = setTimeout(() => controller.abort(), reqTimeout);
+			const timeoutId = setTimeout(() => controller.abort(), fireAndForget ? 5000 : reqTimeout); // Shorter timeout for fire-and-forget
+			
 			try {
-				const response = await fetch(url, { method: 'GET', signal: controller.signal });
-				clearTimeout(timeoutId);
+				const fetchPromise = fetch(url, { 
+					method: 'GET', 
+					signal: controller.signal,
+					// For RabbitMQ/queue services, we don't need to wait for full response
+					...(fireAndForget && { 
+						headers: { 'Connection': 'close' },
+						keepalive: false 
+					})
+				});
 
-				if (response.ok) {
-					progress.sent += 1;
+				if (fireAndForget) {
+					// For RabbitMQ: just check that request was sent successfully
+					const response = await Promise.race([
+						fetchPromise,
+						new Promise((_, reject) => setTimeout(() => reject(new Error('Quick timeout')), 1000))
+					]);
 					
-					// Python-style success logging
-					console.log(`[job ${jobId}] Отправлен запрос ${progress.sent} из ${progress.total}`);
-					console.log(`[job ${jobId}] Статус ответа: ${response.status}`);
+					clearTimeout(timeoutId);
+					
+					// If we get here, request was sent successfully
+					progress.sent += 1;
+					console.log(`[job ${jobId}] Отправлен запрос ${progress.sent} из ${progress.total} (fire-and-forget)`);
+					console.log(`[job ${jobId}] Статус: ${response.status} (не ждем полного ответа)`);
 					console.log(`[job ${jobId}] ---`);
 					
-					// cap logs to avoid unbounded growth
-					progress.logs.push({ level: 'info', msg: `OK ${progress.sent}/${progress.total}`, url, status: response.status });
-					if (progress.logs.length > 1000) progress.logs.splice(0, progress.logs.length - 1000);
-					
-					// Increment per-type counters (lead/sale)
-					try {
-						const statusKind = mapStatus(row['\u0421\u0442\u0430\u0441\u0442\u0443\u0441'] ?? row['Статус']);
-						if (statusKind === 'lead') progress.leads += 1;
-						else if (statusKind === 'sale') progress.sales += 1;
-					} catch {}
-					
+					// Don't wait for response body for RabbitMQ
 					return index;
 				} else {
-					let content = '';
-					try { content = await response.text(); } catch {}
-					progress.errors += 1;
-					
-					// Python-style error logging
-					console.error(`[job ${jobId}] Ошибка при отправке запроса. Статус: ${response.status}`);
-					console.error(`[job ${jobId}] Ответ сервера: ${content?.slice(0,200) ?? ''}`);
-					
-					progress.logs.push({ level: 'error', msg: `HTTP ${response.status}`, url, content });
-					if (progress.logs.length > 1000) progress.logs.splice(0, progress.logs.length - 1000);
-					
-					return null;
+					// Normal processing - wait for full response
+					const response = await fetchPromise;
+					clearTimeout(timeoutId);
+
+					if (response.ok) {
+						progress.sent += 1;
+						console.log(`[job ${jobId}] Отправлен запрос ${progress.sent} из ${progress.total}`);
+						console.log(`[job ${jobId}] Статус ответа: ${response.status}`);
+						console.log(`[job ${jobId}] ---`);
+						return index;
+					} else {
+						let content = '';
+						try { content = await response.text(); } catch {}
+						progress.errors += 1;
+						console.error(`[job ${jobId}] Ошибка при отправке запроса. Статус: ${response.status}`);
+						console.error(`[job ${jobId}] Ответ сервера: ${content?.slice(0,200) ?? ''}`);
+						console.error(`[job ${jobId}] ---`);
+						return null;
+					}
 				}
 			} catch (err) {
 				clearTimeout(timeoutId);
-				progress.errors += 1;
-				const isAbort = (err && (err.name === 'AbortError' || String(err).includes('AbortError')));
 				
-				if (isAbort) {
-					console.error(`[job ${jobId}] Timeout after ${reqTimeout}ms | ${url}`);
-					progress.logs.push({ level: 'error', msg: `Timeout after ${reqTimeout}ms`, url });
-				} else {
-					console.error(`[job ${jobId}] Ошибка при отправке запроса: ${String(err)}`);
-					progress.logs.push({ level: 'error', msg: `Fetch error: ${String(err)}` });
+				if (fireAndForget && (err.message === 'Quick timeout' || err.name === 'AbortError')) {
+					// For fire-and-forget, timeout after sending is OK
+					progress.sent += 1;
+					console.log(`[job ${jobId}] Запрос отправлен ${progress.sent} из ${progress.total} (таймаут после отправки - OK для RabbitMQ)`);
+					console.log(`[job ${jobId}] ---`);
+					return index;
 				}
 				
-				if (progress.logs.length > 1000) progress.logs.splice(0, progress.logs.length - 1000);
+				progress.errors += 1;
+				if (err.name === 'AbortError') {
+					console.error(`[job ${jobId}] Запрос отменен по таймауту (${fireAndForget ? '5000' : reqTimeout}ms)`);
+				} else {
+					console.error(`[job ${jobId}] Ошибка сети: ${String(err)}`);
+				}
+				console.error(`[job ${jobId}] ---`);
 				return null;
 			}
 		});
@@ -356,7 +372,7 @@ async function runJob(job) {
 	await acquireJobSlot();
 	
 	try {
-		const { id, pixel, file, baseUrl, chunkSize, reqDelay, chunkDelay, reqTimeout, sessionTimeout } = job;
+		const { id, pixel, file, baseUrl, chunkSize, reqDelay, chunkDelay, reqTimeout, sessionTimeout, fireAndForget } = job;
 		job.status = 'running';
 		job.startedAt = new Date().toISOString();
 		await redisUpdateJobBatched(job, { force: true });
@@ -418,7 +434,7 @@ async function runJob(job) {
     };
 
     // Process CSV files sequentially to reduce memory usage
-    const sessionOpts = { baseUrl, pixel, chunkSize, reqDelay, chunkDelay, reqTimeout, progress: job.progress, jobId: id };
+    const sessionOpts = { baseUrl, pixel, chunkSize, reqDelay, chunkDelay, reqTimeout, fireAndForget, progress: job.progress, jobId: id };
     const hasLimits = (job.limits?.leads || 0) > 0 || (job.limits?.sales || 0) > 0;
     let leadsLeft = job.limits?.leads || 0;
     let salesLeft = job.limits?.sales || 0;
@@ -564,7 +580,7 @@ async function runJob(job) {
 }
 
 // Redis-backed job store API
-async function createJob({ pixel, file, baseUrl, chunkSize, reqDelay, chunkDelay, reqTimeout, sessionTimeout, connLimit, leadsCount = 0, salesCount = 0, clientId = null }) {
+async function createJob({ pixel, file, baseUrl, chunkSize, reqDelay, chunkDelay, reqTimeout, sessionTimeout, connLimit, fireAndForget = false, leadsCount = 0, salesCount = 0, clientId = null }) {
 	const id = crypto.randomUUID();
 	const job = {
 		id,
@@ -581,6 +597,7 @@ async function createJob({ pixel, file, baseUrl, chunkSize, reqDelay, chunkDelay
 		reqTimeout,
 		sessionTimeout: (Number(sessionTimeout) > 0 ? Number(sessionTimeout) : null),
 		connLimit,
+		fireAndForget,
 		progress: { sent: 0, total: 0, errors: 0, leads: 0, sales: 0, logs: [] },
 		error: null,
 		cancelled: false,
@@ -808,6 +825,7 @@ router.post('/send', async (req, res) => {
             reqTimeout: Number(effectiveReqTimeout),
             sessionTimeout: Number(sessionTimeout) > 0 ? Number(sessionTimeout) : null,
             connLimit: Number(connLimit) || DEFAULTS.connLimit,
+            fireAndForget: Boolean(req.body.fireAndForget) || false,
             leadsCount: Number(leadsCount) || 0,
             salesCount: Number(salesCount) || 0,
             clientId: String(clientIdHeader || clientIdBody || req.clientId || ''),
