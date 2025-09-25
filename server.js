@@ -25,7 +25,9 @@ const DEFAULT_ROUTE_URL = process.env.DEFAULT_ROUTE_URL || '';
 const DEFAULTS = {
 	reqDelay: 100,            // задержка между запросами (мс)
 	reqTimeout: 30_000,       // таймаут на один запрос (мс)
-	connLimit: 10             // максимальное число соединений (параллельных запросов)
+	connLimit: 10,            // максимальное число соединений (параллельных запросов)
+	chunkSize: 5,             // количество одновременных запросов в чанке
+	chunkDelay: 500           // задержка между чанками (мс)
 };
 
 // TTLs for Redis entries
@@ -178,16 +180,18 @@ function buildUrl(baseUrl, pixel, row) {
         throw new Error('Base URL is empty or not absolute (must start with http:// or https://)');
     }
 
-    const userAgent = encodeURIComponent(String(row['User Agent'] ?? ''));
-    const fbclid = row['Sub ID 7'];
+    // Extract parameters like in Python version
+    const pixelValue = String(pixel).replace('.0', ''); // Remove .0 like in Python
+    const fbclid = row['Sub ID 28'] ?? row['Sub ID 7'] ?? '';
     const ip = row['IP'] ?? '';
     const subid = row['Subid'] ?? '';
+    const userAgent = encodeURIComponent(String(row['User Agent'] ?? ''));
     const country = row['\u0424\u043b\u0430\u0433 \u0441\u0442\u0440\u0430\u043d\u044b'] ?? row['Флаг страны'] ?? '';
     const status = mapStatus(row['\u0421\u0442\u0430\u0441\u0442\u0443\u0441'] ?? row['Статус']);
 
     const sep = String(baseUrl).includes('?') ? '&' : '?';
     const url =
-        `${baseUrl}${sep}pixel=${encodeURIComponent(String(pixel))}` +
+        `${baseUrl}${sep}pixel=${encodeURIComponent(pixelValue)}` +
         `&fbclid=${fbclid}` +
         `&ip=${ip}` +
         `&subid=${subid}` +
@@ -203,7 +207,11 @@ async function sendRequest({ baseUrl, pixel, row, index, reqDelay, reqTimeout, p
 		if (await isCancelled(jobId)) return null;
 
 		const url = buildUrl(baseUrl, pixel, row);
-		// Delay between requests
+		
+		// Python-style detailed logging
+		console.log(`[job ${jobId}] URL: ${url}`);
+		
+		// Delay between requests (like Python asyncio.sleep(0.1))
 		await sleep(reqDelay);
 
 		// Cancel after delay as well
@@ -218,45 +226,52 @@ async function sendRequest({ baseUrl, pixel, row, index, reqDelay, reqTimeout, p
 
 				if (response.ok) {
 					progress.sent += 1;
+					
+					// Python-style success logging
+					console.log(`[job ${jobId}] Отправлен запрос ${progress.sent} из ${progress.total}`);
+					console.log(`[job ${jobId}] Статус ответа: ${response.status}`);
+					console.log(`[job ${jobId}] ---`);
+					
 					// cap logs to avoid unbounded growth
 					progress.logs.push({ level: 'info', msg: `OK ${progress.sent}/${progress.total}`, url, status: response.status });
 					if (progress.logs.length > 1000) progress.logs.splice(0, progress.logs.length - 1000);
+					
 					// Increment per-type counters (lead/sale)
 					try {
 						const statusKind = mapStatus(row['\u0421\u0442\u0430\u0441\u0442\u0443\u0441'] ?? row['Статус']);
 						if (statusKind === 'lead') progress.leads += 1;
 						else if (statusKind === 'sale') progress.sales += 1;
 					} catch {}
-					// Emit concise success log every N requests so operators can see workers are active
-                    if (progress.sent % SUCCESS_LOG_EVERY === 0) {
-                        try {
-                            console.log(`[job ${jobId}] ok=${progress.sent}/${progress.total} errors=${progress.errors} pid=${process.pid}`);
-                        } catch {}
-                    }
+					
 					return index;
 				} else {
 					let content = '';
 					try { content = await response.text(); } catch {}
 					progress.errors += 1;
+					
+					// Python-style error logging
+					console.error(`[job ${jobId}] Ошибка при отправке запроса. Статус: ${response.status}`);
+					console.error(`[job ${jobId}] Ответ сервера: ${content?.slice(0,200) ?? ''}`);
+					
 					progress.logs.push({ level: 'error', msg: `HTTP ${response.status}`, url, content });
 					if (progress.logs.length > 1000) progress.logs.splice(0, progress.logs.length - 1000);
-					// Log only errors to console with compact, single-line output
-					console.error(`[job ${jobId}] HTTP ${response.status} | ${url} | ${content?.slice(0,200) ?? ''}`);
+					
 					return null;
 				}
 			} catch (err) {
 				clearTimeout(timeoutId);
 				progress.errors += 1;
 				const isAbort = (err && (err.name === 'AbortError' || String(err).includes('AbortError')));
+				
 				if (isAbort) {
-					progress.logs.push({ level: 'error', msg: `Timeout after ${reqTimeout}ms`, url });
-					if (progress.logs.length > 1000) progress.logs.splice(0, progress.logs.length - 1000);
 					console.error(`[job ${jobId}] Timeout after ${reqTimeout}ms | ${url}`);
+					progress.logs.push({ level: 'error', msg: `Timeout after ${reqTimeout}ms`, url });
 				} else {
+					console.error(`[job ${jobId}] Ошибка при отправке запроса: ${String(err)}`);
 					progress.logs.push({ level: 'error', msg: `Fetch error: ${String(err)}` });
-					if (progress.logs.length > 1000) progress.logs.splice(0, progress.logs.length - 1000);
-					console.error(`[job ${jobId}] Fetch error: ${String(err)}`);
 				}
+				
+				if (progress.logs.length > 1000) progress.logs.splice(0, progress.logs.length - 1000);
 				return null;
 			}
 		});
@@ -341,7 +356,7 @@ async function runJob(job) {
 	await acquireJobSlot();
 	
 	try {
-		const { id, pixel, file, baseUrl, reqDelay, reqTimeout, sessionTimeout } = job;
+		const { id, pixel, file, baseUrl, chunkSize, reqDelay, chunkDelay, reqTimeout, sessionTimeout } = job;
 		job.status = 'running';
 		job.startedAt = new Date().toISOString();
 		await redisUpdateJobBatched(job, { force: true });
@@ -403,7 +418,7 @@ async function runJob(job) {
     };
 
     // Process CSV files sequentially to reduce memory usage
-    const sessionOpts = { baseUrl, pixel, reqDelay, reqTimeout, progress: job.progress, jobId: id };
+    const sessionOpts = { baseUrl, pixel, chunkSize, reqDelay, chunkDelay, reqTimeout, progress: job.progress, jobId: id };
     const hasLimits = (job.limits?.leads || 0) > 0 || (job.limits?.sales || 0) > 0;
     let leadsLeft = job.limits?.leads || 0;
     let salesLeft = job.limits?.sales || 0;
@@ -464,12 +479,14 @@ async function runJob(job) {
             job.progress.total += records.length;
             await redisUpdateJobBatched(job);
 
-            // Process each record sequentially
-            for (let i = 0; i < records.length; i++) {
-                const row = records[i];
-                const index = totalRecords + i;
-
-                // Check cancellation before each request
+            // Process records in chunks like Python version
+            const chunkSize = sessionOpts.chunkSize || DEFAULTS.chunkSize;
+            const chunkDelay = sessionOpts.chunkDelay || DEFAULTS.chunkDelay;
+            
+            console.log(`[job ${id}] Processing ${records.length} records in chunks of ${chunkSize}`);
+            
+            for (let i = 0; i < records.length; i += chunkSize) {
+                // Check cancellation before each chunk
                 if (await isCancelled(id)) {
                     job.cancelled = true;
                     job.status = 'cancelled';
@@ -490,12 +507,28 @@ async function runJob(job) {
                     return;
                 }
 
-                // Send single request
-                await sendRequest({ ...sessionOpts, row, index });
+                // Process chunk of records concurrently (like Python asyncio.gather)
+                const chunk = records.slice(i, i + chunkSize);
+                const chunkTasks = chunk.map((row, chunkIndex) => {
+                    const index = totalRecords + i + chunkIndex;
+                    return sendRequest({ ...sessionOpts, row, index });
+                });
                 
-                // Update progress after each request (every 10 requests to reduce Redis load)
-                if ((i + 1) % 10 === 0 || i === records.length - 1) {
-                    await redisUpdateJobBatched(job);
+                console.log(`[job ${id}] Processing chunk ${Math.floor(i/chunkSize) + 1}/${Math.ceil(records.length/chunkSize)} (${chunk.length} requests)`);
+                
+                // Wait for all requests in chunk to complete
+                const results = await Promise.allSettled(chunkTasks);
+                
+                // Count successful requests
+                const successful = results.filter(r => r.status === 'fulfilled' && r.value !== null).length;
+                console.log(`[job ${id}] Chunk completed: ${successful}/${chunk.length} successful`);
+                
+                // Update progress after each chunk
+                await redisUpdateJobBatched(job);
+                
+                // Delay between chunks (like Python asyncio.sleep(0.5))
+                if (i + chunkSize < records.length) {
+                    await sleep(chunkDelay);
                 }
             }
 
@@ -531,7 +564,7 @@ async function runJob(job) {
 }
 
 // Redis-backed job store API
-async function createJob({ pixel, file, baseUrl, reqDelay, reqTimeout, sessionTimeout, connLimit, leadsCount = 0, salesCount = 0, clientId = null }) {
+async function createJob({ pixel, file, baseUrl, chunkSize, reqDelay, chunkDelay, reqTimeout, sessionTimeout, connLimit, leadsCount = 0, salesCount = 0, clientId = null }) {
 	const id = crypto.randomUUID();
 	const job = {
 		id,
@@ -542,7 +575,9 @@ async function createJob({ pixel, file, baseUrl, reqDelay, reqTimeout, sessionTi
 		pixel,
 		file,
 		baseUrl,
+		chunkSize,
 		reqDelay,
+		chunkDelay,
 		reqTimeout,
 		sessionTimeout: (Number(sessionTimeout) > 0 ? Number(sessionTimeout) : null),
 		connLimit,
@@ -767,7 +802,9 @@ router.post('/send', async (req, res) => {
             pixel,
             file: resolvedFile,
             baseUrl: effectiveBaseUrl,
+            chunkSize: Number(req.body.chunkSize) || DEFAULTS.chunkSize,
             reqDelay: Number(reqDelay),
+            chunkDelay: Number(req.body.chunkDelay) || DEFAULTS.chunkDelay,
             reqTimeout: Number(effectiveReqTimeout),
             sessionTimeout: Number(sessionTimeout) > 0 ? Number(sessionTimeout) : null,
             connLimit: Number(connLimit) || DEFAULTS.connLimit,
