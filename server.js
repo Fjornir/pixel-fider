@@ -297,61 +297,30 @@ async function runJob(job) {
 
 	console.log(`Attempting to read file: ${file}`);
 	
-    // Read CSV(s): support both a single file and a directory with multiple CSV files
-    let records;
+    // Sequential CSV processing to reduce memory load
+    let csvFiles = [];
+    let totalRecords = 0;
+    
     try {
         const stat = await fs.stat(file);
-        const parseWithFallbacks = (csvContent) => {
-            const parseOptions = [
-                { delimiter: ';', quote: '"', skip_empty_lines: true, trim: true },
-                { delimiter: ',', quote: '"', skip_empty_lines: true, trim: true },
-                { delimiter: '\t', quote: '"', skip_empty_lines: true, trim: true }
-            ];
-            let lastErr = null;
-            for (const options of parseOptions) {
-                try {
-                    const recs = parse(csvContent, { columns: true, ...options });
-                    if (recs.length > 0 && Object.keys(recs[0]).length > 1) return recs;
-                } catch (e) {
-                    lastErr = e;
-                }
-            }
-            if (lastErr) throw lastErr;
-            return [];
-        };
-
+        
         if (stat.isDirectory()) {
-            console.log(`Input is a directory. Reading all CSV files in: ${file}`);
+            console.log(`Input is a directory. Scanning CSV files in: ${file}`);
             const dirEntries = await fs.readdir(file, { withFileTypes: true });
-            const csvFiles = dirEntries
+            csvFiles = dirEntries
                 .filter((e) => e.isFile() && e.name.toLowerCase().endsWith('.csv'))
                 .map((e) => path.resolve(file, e.name));
-            console.log(`Found ${csvFiles.length} CSV files`);
-            const all = [];
-            for (const csvPath of csvFiles) {
-                try {
-                    const csvContent = await fs.readFile(csvPath, 'utf-8');
-                    const recs = parseWithFallbacks(csvContent);
-                    console.log(`Parsed ${recs.length} records from ${path.basename(csvPath)}`);
-                    all.push(...recs);
-                } catch (e) {
-                    console.error(`Failed to read/parse ${csvPath}: ${e?.message || e}`);
-                }
-            }
-            records = all;
+            console.log(`Found ${csvFiles.length} CSV files for sequential processing`);
         } else {
-            console.log(`Reading single CSV file: ${file}`);
-            const csvContent = await fs.readFile(file, 'utf-8');
-            records = parseWithFallbacks(csvContent);
-            console.log(`Parsed ${records.length} records`);
+            console.log(`Single CSV file: ${file}`);
+            csvFiles = [file];
         }
 
-        if (records.length > 0) {
-            console.log('First record fields:', Object.keys(records[0]));
-            console.log('First 3 records:', records.slice(0, 3));
+        if (csvFiles.length === 0) {
+            throw new Error('No CSV files found');
         }
     } catch (e) {
-        const errorMsg = `Ошибка чтения/парсинга CSV: ${e?.message || e}`;
+        const errorMsg = `Ошибка доступа к файлам: ${e?.message || e}`;
         job.status = 'failed';
         job.error = errorMsg;
         job.finishedAt = new Date().toISOString();
@@ -359,55 +328,127 @@ async function runJob(job) {
         return;
     }
 
-	// Apply per-type limits if provided
-	const hasLimits = (job.limits?.leads || 0) > 0 || (job.limits?.sales || 0) > 0;
-	if (hasLimits) {
-		const limited = [];
-		let leadsLeft = job.limits.leads || 0;
-		let salesLeft = job.limits.sales || 0;
-		for (const rec of records) {
-			const kind = mapStatus(rec['\u0421\u0442\u0430\u0441\u0442\u0443\u0441'] ?? rec['Статус']);
-			if (kind === 'lead' && leadsLeft > 0) { limited.push(rec); leadsLeft--; }
-			else if (kind === 'sale' && salesLeft > 0) { limited.push(rec); salesLeft--; }
-			if (leadsLeft <= 0 && salesLeft <= 0) break;
-		}
-		records = limited;
-	}
+    // Helper function to parse CSV with fallback delimiters
+    const parseWithFallbacks = (csvContent) => {
+        const parseOptions = [
+            { delimiter: ';', quote: '"', skip_empty_lines: true, trim: true },
+            { delimiter: ',', quote: '"', skip_empty_lines: true, trim: true },
+            { delimiter: '\t', quote: '"', skip_empty_lines: true, trim: true }
+        ];
+        let lastErr = null;
+        for (const options of parseOptions) {
+            try {
+                const recs = parse(csvContent, { columns: true, ...options });
+                if (recs.length > 0 && Object.keys(recs[0]).length > 1) return recs;
+            } catch (e) {
+                lastErr = e;
+            }
+        }
+        if (lastErr) throw lastErr;
+        return [];
+    };
 
-	job.progress.total = records.length;
-	await redisUpdateJobBatched(job);
+    // Process CSV files sequentially to reduce memory usage
+    const sessionOpts = { baseUrl, pixel, reqDelay, reqTimeout, progress: job.progress, jobId: id };
+    const hasLimits = (job.limits?.leads || 0) > 0 || (job.limits?.sales || 0) > 0;
+    let leadsLeft = job.limits?.leads || 0;
+    let salesLeft = job.limits?.sales || 0;
+    let processedFiles = 0;
 
-	const indexed = records.map((row, index) => ({ row, index }));
-	const chunks = chunkArray(indexed, chunkSize);
-	const successfulIndices = [];
+    for (const csvPath of csvFiles) {
+        // Check cancellation before each file
+        if (await isCancelled(id)) {
+            job.cancelled = true;
+            job.status = 'cancelled';
+            job.finishedAt = new Date().toISOString();
+            await redisUpdateJobBatched(job, { force: true });
+            console.log(`[job ${id}] cancelled after ${processedFiles}/${csvFiles.length} files | ok=${job.progress.sent}/${job.progress.total} errors=${job.progress.errors}`);
+            return;
+        }
 
-	const sessionOpts = { baseUrl, pixel, reqDelay, reqTimeout, progress: job.progress, jobId: id };
+        // Session timeout check
+        if (sessionDeadline && Date.now() > sessionDeadline) {
+            job.status = 'failed';
+            job.error = `Session timeout after ${Number(sessionTimeout)}ms`;
+            job.finishedAt = new Date().toISOString();
+            await setCancelled(id);
+            await redisUpdateJobBatched(job, { force: true });
+            console.error(`[job ${id}] session timeout after ${processedFiles}/${csvFiles.length} files`);
+            return;
+        }
 
-	for (const chunk of chunks) {
-		// Session timeout check (only if provided)
-		if (sessionDeadline && Date.now() > sessionDeadline) {
-			job.status = 'failed';
-			job.error = `Session timeout after ${Number(sessionTimeout)}ms`;
-			job.finishedAt = new Date().toISOString();
-			await setCancelled(id);
-			await redisUpdateJobBatched(job, { force: true });
-			console.error(`[job ${id}] session timeout`);
-			return;
-		}
-		// Fast cancel check from Redis before each chunk
-		if (await isCancelled(id)) {
-			job.cancelled = true;
-			job.status = 'cancelled';
-			job.finishedAt = new Date().toISOString();
-			await redisUpdateJobBatched(job, { force: true });
-			console.log(`[job ${id}] cancelled | ok=${job.progress.sent}/${job.progress.total} errors=${job.progress.errors} leads=${job.progress.leads} sales=${job.progress.sales}`);
-			return;
-		}
-		const results = await processChunk(sessionOpts, chunk);
-		for (const idx of results) if (idx !== null && idx !== undefined) successfulIndices.push(idx);
-		await redisUpdateJobBatched(job);
-		await sleep(chunkDelay);
-	}
+        try {
+            console.log(`Processing file ${processedFiles + 1}/${csvFiles.length}: ${path.basename(csvPath)}`);
+            const csvContent = await fs.readFile(csvPath, 'utf-8');
+            let records = parseWithFallbacks(csvContent);
+            console.log(`Parsed ${records.length} records from ${path.basename(csvPath)}`);
+
+            // Apply limits if specified
+            if (hasLimits && (leadsLeft <= 0 && salesLeft <= 0)) {
+                console.log(`Limits reached, skipping remaining files`);
+                break;
+            }
+
+            if (hasLimits) {
+                const limited = [];
+                for (const rec of records) {
+                    const kind = mapStatus(rec['\u0421\u0442\u0430\u0441\u0442\u0443\u0441'] ?? rec['Статус']);
+                    if (kind === 'lead' && leadsLeft > 0) { 
+                        limited.push(rec); 
+                        leadsLeft--; 
+                    } else if (kind === 'sale' && salesLeft > 0) { 
+                        limited.push(rec); 
+                        salesLeft--; 
+                    }
+                    if (leadsLeft <= 0 && salesLeft <= 0) break;
+                }
+                records = limited;
+                console.log(`Applied limits: ${records.length} records selected (leads left: ${leadsLeft}, sales left: ${salesLeft})`);
+            }
+
+            // Update total count and process records in chunks
+            job.progress.total += records.length;
+            await redisUpdateJobBatched(job);
+
+            const indexed = records.map((row, index) => ({ row, index: totalRecords + index }));
+            totalRecords += records.length;
+            const chunks = chunkArray(indexed, chunkSize);
+
+            for (const chunk of chunks) {
+                // Check cancellation before each chunk
+                if (await isCancelled(id)) {
+                    job.cancelled = true;
+                    job.status = 'cancelled';
+                    job.finishedAt = new Date().toISOString();
+                    await redisUpdateJobBatched(job, { force: true });
+                    console.log(`[job ${id}] cancelled during file processing | ok=${job.progress.sent}/${job.progress.total} errors=${job.progress.errors}`);
+                    return;
+                }
+
+                // Session timeout check
+                if (sessionDeadline && Date.now() > sessionDeadline) {
+                    job.status = 'failed';
+                    job.error = `Session timeout after ${Number(sessionTimeout)}ms`;
+                    job.finishedAt = new Date().toISOString();
+                    await setCancelled(id);
+                    await redisUpdateJobBatched(job, { force: true });
+                    console.error(`[job ${id}] session timeout during chunk processing`);
+                    return;
+                }
+
+                const results = await processChunk(sessionOpts, chunk);
+                await redisUpdateJobBatched(job);
+                await sleep(chunkDelay);
+            }
+
+            processedFiles++;
+            console.log(`Completed file ${processedFiles}/${csvFiles.length}: ${path.basename(csvPath)}`);
+
+        } catch (e) {
+            console.error(`Failed to process ${csvPath}: ${e?.message || e}`);
+            // Continue with next file instead of failing the entire job
+        }
+    }
 
 	// Note: we no longer modify the source CSV file. Successful rows are NOT removed.
 
