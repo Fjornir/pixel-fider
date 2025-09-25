@@ -23,9 +23,7 @@ const redis = new Redis(REDIS_URL);
 // Default config
 const DEFAULT_ROUTE_URL = process.env.DEFAULT_ROUTE_URL || '';
 const DEFAULTS = {
-	chunkSize: 5,            // количество запросов в пачке
 	reqDelay: 100,            // задержка между запросами (мс)
-	chunkDelay: 500,          // задержка между пачками (мс)
 	reqTimeout: 30_000,       // таймаут на один запрос (мс)
 	connLimit: 10             // максимальное число соединений (параллельных запросов)
 };
@@ -46,12 +44,64 @@ const keepAliveAgent = new Agent({
 });
 setGlobalDispatcher(keepAliveAgent);
 
-// Global concurrency limiter
+// Global concurrency limiter for HTTP requests
 const MAX_CONCURRENCY = Math.max(1, Number(process.env.MAX_CONCURRENCY) || DEFAULTS.connLimit);
 // How often to emit a short success log to stdout (to avoid log spam)
 const SUCCESS_LOG_EVERY = Math.max(1, Number(process.env.SUCCESS_LOG_EVERY) || 50);
 let concurrencyInUse = 0;
 const concurrencyWaiters = [];
+
+// Job queue management to prevent server overload
+const MAX_CONCURRENT_JOBS = Math.max(1, Number(process.env.MAX_CONCURRENT_JOBS) || 3);
+const MAX_QUEUE_SIZE = Math.max(10, Number(process.env.MAX_QUEUE_SIZE) || 50);
+let runningJobs = 0;
+const jobQueue = [];
+
+// Memory and resource monitoring
+const MEMORY_CHECK_INTERVAL = 30000; // 30 seconds
+let lastMemoryCheck = 0;
+
+function checkMemoryUsage() {
+	const now = Date.now();
+	if (now - lastMemoryCheck < MEMORY_CHECK_INTERVAL) return;
+	lastMemoryCheck = now;
+	
+	const usage = process.memoryUsage();
+	const heapUsedMB = Math.round(usage.heapUsed / 1024 / 1024);
+	const heapTotalMB = Math.round(usage.heapTotal / 1024 / 1024);
+	const rssMB = Math.round(usage.rss / 1024 / 1024);
+	
+	console.log(`[MEMORY] RSS: ${rssMB}MB, Heap: ${heapUsedMB}/${heapTotalMB}MB, Jobs: ${runningJobs}/${MAX_CONCURRENT_JOBS}, Queue: ${jobQueue.length}`);
+	
+	// Warning if memory usage is high
+	if (heapUsedMB > 1000) {
+		console.warn(`[WARNING] High memory usage: ${heapUsedMB}MB heap used`);
+	}
+}
+
+async function acquireJobSlot() {
+	checkMemoryUsage();
+	
+	if (runningJobs < MAX_CONCURRENT_JOBS) {
+		runningJobs += 1;
+		return;
+	}
+	
+	// Check queue size limit
+	if (jobQueue.length >= MAX_QUEUE_SIZE) {
+		throw new Error(`Job queue is full (${jobQueue.length}/${MAX_QUEUE_SIZE}). Server is overloaded.`);
+	}
+	
+	await new Promise((resolve) => jobQueue.push(resolve));
+	runningJobs += 1;
+}
+
+function releaseJobSlot() {
+	runningJobs -= 1;
+	const next = jobQueue.shift();
+	if (next) next();
+}
+
 async function acquireConcurrency() {
 	if (concurrencyInUse < MAX_CONCURRENCY) {
 		concurrencyInUse += 1;
@@ -287,15 +337,19 @@ function redisUpdateJobBatched(job, { force = false } = {}) {
 }
 
 async function runJob(job) {
-	const { id, pixel, file, baseUrl, chunkSize, reqDelay, chunkDelay, reqTimeout, sessionTimeout } = job;
-	job.status = 'running';
-	job.startedAt = new Date().toISOString();
-	await redisUpdateJobBatched(job, { force: true });
+	// Acquire job slot to limit concurrent jobs
+	await acquireJobSlot();
+	
+	try {
+		const { id, pixel, file, baseUrl, reqDelay, reqTimeout, sessionTimeout } = job;
+		job.status = 'running';
+		job.startedAt = new Date().toISOString();
+		await redisUpdateJobBatched(job, { force: true });
 
-	const startedAtMs = Date.now();
-	const sessionDeadline = (Number(sessionTimeout) > 0) ? (startedAtMs + Number(sessionTimeout)) : null;
+		const startedAtMs = Date.now();
+		const sessionDeadline = (Number(sessionTimeout) > 0) ? (startedAtMs + Number(sessionTimeout)) : null;
 
-	console.log(`Attempting to read file: ${file}`);
+		console.log(`[job ${id}] Starting job (${runningJobs}/${MAX_CONCURRENT_JOBS} slots used) - file: ${file}`);
 	
     // Sequential CSV processing to reduce memory load
     let csvFiles = [];
@@ -406,22 +460,22 @@ async function runJob(job) {
                 console.log(`Applied limits: ${records.length} records selected (leads left: ${leadsLeft}, sales left: ${salesLeft})`);
             }
 
-            // Update total count and process records in chunks
+            // Update total count and process records one by one
             job.progress.total += records.length;
             await redisUpdateJobBatched(job);
 
-            const indexed = records.map((row, index) => ({ row, index: totalRecords + index }));
-            totalRecords += records.length;
-            const chunks = chunkArray(indexed, chunkSize);
+            // Process each record sequentially
+            for (let i = 0; i < records.length; i++) {
+                const row = records[i];
+                const index = totalRecords + i;
 
-            for (const chunk of chunks) {
-                // Check cancellation before each chunk
+                // Check cancellation before each request
                 if (await isCancelled(id)) {
                     job.cancelled = true;
                     job.status = 'cancelled';
                     job.finishedAt = new Date().toISOString();
                     await redisUpdateJobBatched(job, { force: true });
-                    console.log(`[job ${id}] cancelled during file processing | ok=${job.progress.sent}/${job.progress.total} errors=${job.progress.errors}`);
+                    console.log(`[job ${id}] cancelled during processing | ok=${job.progress.sent}/${job.progress.total} errors=${job.progress.errors}`);
                     return;
                 }
 
@@ -432,13 +486,17 @@ async function runJob(job) {
                     job.finishedAt = new Date().toISOString();
                     await setCancelled(id);
                     await redisUpdateJobBatched(job, { force: true });
-                    console.error(`[job ${id}] session timeout during chunk processing`);
+                    console.error(`[job ${id}] session timeout during processing`);
                     return;
                 }
 
-                const results = await processChunk(sessionOpts, chunk);
-                await redisUpdateJobBatched(job);
-                await sleep(chunkDelay);
+                // Send single request
+                await sendRequest({ ...sessionOpts, row, index });
+                
+                // Update progress after each request (every 10 requests to reduce Redis load)
+                if ((i + 1) % 10 === 0 || i === records.length - 1) {
+                    await redisUpdateJobBatched(job);
+                }
             }
 
             processedFiles++;
@@ -457,10 +515,23 @@ async function runJob(job) {
 	await redisUpdateJobBatched(job, { force: true });
 	await clearCancelled(id);
 	console.log(`[job ${id}] ${job.status} | ok=${job.progress.sent}/${job.progress.total} errors=${job.progress.errors} leads=${job.progress.leads} sales=${job.progress.sales} | maxConcurrency=${MAX_CONCURRENCY} keepAliveConns=${KEEPALIVE_CONNECTIONS}`);
+	
+	} catch (jobError) {
+		// Handle any unexpected errors in job execution
+		console.error(`[job ${job.id}] Unexpected job error:`, jobError);
+		job.status = 'failed';
+		job.error = `Непредвиденная ошибка: ${jobError?.message || jobError}`;
+		job.finishedAt = new Date().toISOString();
+		await redisUpdateJobBatched(job, { force: true });
+	} finally {
+		// Always release the job slot
+		releaseJobSlot();
+		console.log(`[job ${job.id}] Released job slot (${runningJobs}/${MAX_CONCURRENT_JOBS} slots now used)`);
+	}
 }
 
 // Redis-backed job store API
-async function createJob({ pixel, file, baseUrl, chunkSize, reqDelay, chunkDelay, reqTimeout, sessionTimeout, connLimit, leadsCount = 0, salesCount = 0, clientId = null }) {
+async function createJob({ pixel, file, baseUrl, reqDelay, reqTimeout, sessionTimeout, connLimit, leadsCount = 0, salesCount = 0, clientId = null }) {
 	const id = crypto.randomUUID();
 	const job = {
 		id,
@@ -471,9 +542,7 @@ async function createJob({ pixel, file, baseUrl, chunkSize, reqDelay, chunkDelay
 		pixel,
 		file,
 		baseUrl,
-		chunkSize,
 		reqDelay,
-		chunkDelay,
 		reqTimeout,
 		sessionTimeout: (Number(sessionTimeout) > 0 ? Number(sessionTimeout) : null),
 		connLimit,
@@ -484,12 +553,15 @@ async function createJob({ pixel, file, baseUrl, chunkSize, reqDelay, chunkDelay
 		clientId: clientId || crypto.randomUUID(),
 	};
 	await redisSaveJob(job);
-	// Fire and forget
+	// Fire and forget with proper error handling
 	runJob(job).catch(async (e) => {
+		console.error(`[job ${job.id}] Job creation error:`, e);
 		job.status = 'failed';
-		job.error = `Непредвиденная ошибка: ${e}`;
+		job.error = `Непредвиденная ошибка: ${e?.message || e}`;
 		job.finishedAt = new Date().toISOString();
 		await redisUpdateJobBatched(job, { force: true });
+		// Make sure to release job slot if job fails to start
+		releaseJobSlot();
 	});
 	return job;
 }
@@ -599,9 +671,7 @@ router.post('/send', async (req, res) => {
         pixel,
         file,
         url,
-        chunkSize = DEFAULTS.chunkSize,
         reqDelay = DEFAULTS.reqDelay,
-        chunkDelay = DEFAULTS.chunkDelay,
         reqTimeout = DEFAULTS.reqTimeout,
         sessionTimeout,
         connLimit = DEFAULTS.connLimit,
@@ -684,24 +754,41 @@ router.post('/send', async (req, res) => {
 
     const resolvedFile = resolveFilePath(String(file));
 
-    const clientIdHeader = req.get('x-client-id');
-    const job = await createJob({
-        pixel,
-        file: resolvedFile,
-        baseUrl: effectiveBaseUrl,
-        chunkSize: Number(chunkSize),
-        reqDelay: Number(reqDelay),
-        chunkDelay: Number(chunkDelay),
-        reqTimeout: Number(effectiveReqTimeout),
-        sessionTimeout: Number(sessionTimeout) > 0 ? Number(sessionTimeout) : null,
-        connLimit: Number(connLimit) || DEFAULTS.connLimit,
-        leadsCount: Number(leadsCount) || 0,
-        salesCount: Number(salesCount) || 0,
-        clientId: String(clientIdHeader || clientIdBody || req.clientId || ''),
-    });
+    // Check server load before creating job
+    if (runningJobs >= MAX_CONCURRENT_JOBS && jobQueue.length >= MAX_QUEUE_SIZE) {
+        return res.status(503).json({ 
+            error: `Сервер перегружен. Активных задач: ${runningJobs}/${MAX_CONCURRENT_JOBS}, в очереди: ${jobQueue.length}/${MAX_QUEUE_SIZE}. Попробуйте позже.` 
+        });
+    }
 
-    // Include both id and jobId for compatibility with UI expecting `id`
-    res.status(202).json({ id: job.id, jobId: job.id, status: job.status, file: resolvedFile, clientId: job.clientId });
+    try {
+        const clientIdHeader = req.get('x-client-id');
+        const job = await createJob({
+            pixel,
+            file: resolvedFile,
+            baseUrl: effectiveBaseUrl,
+            reqDelay: Number(reqDelay),
+            reqTimeout: Number(effectiveReqTimeout),
+            sessionTimeout: Number(sessionTimeout) > 0 ? Number(sessionTimeout) : null,
+            connLimit: Number(connLimit) || DEFAULTS.connLimit,
+            leadsCount: Number(leadsCount) || 0,
+            salesCount: Number(salesCount) || 0,
+            clientId: String(clientIdHeader || clientIdBody || req.clientId || ''),
+        });
+
+        // Include both id and jobId for compatibility with UI expecting `id`
+        res.status(202).json({ 
+            id: job.id, 
+            jobId: job.id, 
+            status: job.status, 
+            file: resolvedFile, 
+            clientId: job.clientId,
+            queuePosition: jobQueue.length > 0 ? jobQueue.length : 0
+        });
+    } catch (e) {
+        console.error('Job creation failed:', e);
+        return res.status(503).json({ error: `Не удалось создать задачу: ${e?.message || e}` });
+    }
 });
 
 // Get job status
