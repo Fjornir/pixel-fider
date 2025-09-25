@@ -297,67 +297,67 @@ async function runJob(job) {
 
 	console.log(`Attempting to read file: ${file}`);
 	
-	// Read CSV
-	let csvContent;
-	try {
-		csvContent = await fs.readFile(file, 'utf-8');
-		console.log('File read successfully, length:', csvContent.length);
-	} catch (e) {
-		const errorMsg = `Ошибка чтения файла: ${e.message}`;
-		console.error(errorMsg);
-		job.status = 'failed';
-		job.error = errorMsg;
-		job.finishedAt = new Date().toISOString();
-		await redisUpdateJobBatched(job, { force: true });
-		return;
-	}
+    // Read CSV(s): support both a single file and a directory with multiple CSV files
+    let records;
+    try {
+        const stat = await fs.stat(file);
+        const parseWithFallbacks = (csvContent) => {
+            const parseOptions = [
+                { delimiter: ';', quote: '"', skip_empty_lines: true, trim: true },
+                { delimiter: ',', quote: '"', skip_empty_lines: true, trim: true },
+                { delimiter: '\t', quote: '"', skip_empty_lines: true, trim: true }
+            ];
+            let lastErr = null;
+            for (const options of parseOptions) {
+                try {
+                    const recs = parse(csvContent, { columns: true, ...options });
+                    if (recs.length > 0 && Object.keys(recs[0]).length > 1) return recs;
+                } catch (e) {
+                    lastErr = e;
+                }
+            }
+            if (lastErr) throw lastErr;
+            return [];
+        };
 
-	let records;
-	try {
-		console.log('Parsing CSV content...');
-		
-		// Try different delimiters and formats
-		const parseOptions = [
-			{ delimiter: ';', quote: '"', skip_empty_lines: true, trim: true },
-			{ delimiter: ',', quote: '"', skip_empty_lines: true, trim: true },
-			{ delimiter: '\t', quote: '"', skip_empty_lines: true, trim: true }
-		];
-		
-		let parseError = null;
-		
-		for (const options of parseOptions) {
-			try {
-				console.log(`Trying delimiter: ${JSON.stringify(options.delimiter)}`);
-				records = parse(csvContent, {
-					columns: true,
-					...options
-				});
-				
-				if (records.length > 0 && Object.keys(records[0]).length > 1) {
-					console.log(`Successfully parsed with delimiter: ${JSON.stringify(options.delimiter)}`);
-					parseError = null;
-					break;
-				}
-			} catch (e) {
-				parseError = e;
-				console.log(`Failed with delimiter ${options.delimiter}:`, e.message);
-			}
-		}
-		
-		if (parseError) throw parseError;
-		
-		console.log(`Parsed ${records.length} records`);
-		if (records.length > 0) {
-			console.log('First record fields:', Object.keys(records[0]));
-			console.log('First 3 records:', records.slice(0, 3));
-		}
-	} catch (e) {
-		job.status = 'failed';
-		job.error = `Ошибка парсинга CSV: ${e}`;
-		job.finishedAt = new Date().toISOString();
-		await redisUpdateJobBatched(job, { force: true });
-		return;
-	}
+        if (stat.isDirectory()) {
+            console.log(`Input is a directory. Reading all CSV files in: ${file}`);
+            const dirEntries = await fs.readdir(file, { withFileTypes: true });
+            const csvFiles = dirEntries
+                .filter((e) => e.isFile() && e.name.toLowerCase().endsWith('.csv'))
+                .map((e) => path.resolve(file, e.name));
+            console.log(`Found ${csvFiles.length} CSV files`);
+            const all = [];
+            for (const csvPath of csvFiles) {
+                try {
+                    const csvContent = await fs.readFile(csvPath, 'utf-8');
+                    const recs = parseWithFallbacks(csvContent);
+                    console.log(`Parsed ${recs.length} records from ${path.basename(csvPath)}`);
+                    all.push(...recs);
+                } catch (e) {
+                    console.error(`Failed to read/parse ${csvPath}: ${e?.message || e}`);
+                }
+            }
+            records = all;
+        } else {
+            console.log(`Reading single CSV file: ${file}`);
+            const csvContent = await fs.readFile(file, 'utf-8');
+            records = parseWithFallbacks(csvContent);
+            console.log(`Parsed ${records.length} records`);
+        }
+
+        if (records.length > 0) {
+            console.log('First record fields:', Object.keys(records[0]));
+            console.log('First 3 records:', records.slice(0, 3));
+        }
+    } catch (e) {
+        const errorMsg = `Ошибка чтения/парсинга CSV: ${e?.message || e}`;
+        job.status = 'failed';
+        job.error = errorMsg;
+        job.finishedAt = new Date().toISOString();
+        await redisUpdateJobBatched(job, { force: true });
+        return;
+    }
 
 	// Apply per-type limits if provided
 	const hasLimits = (job.limits?.leads || 0) > 0 || (job.limits?.sales || 0) > 0;
@@ -520,13 +520,20 @@ router.get('/', (_req, res) => {
 router.get('/countries', async (_req, res) => {
     try {
         const entries = await fs.readdir(COUNTRIES_DIR, { withFileTypes: true });
-        const items = entries
-            .filter((e) => e.isFile() && e.name.toLowerCase().endsWith('.csv'))
-            .map((e) => {
-                const file = e.name;
-                const code = file.replace(/\.csv$/i, '');
-                return { code, file: path.join('countries', file) };
-            });
+        // New behavior: return country folders (geo codes) that contain CSV files
+        const dirItems = [];
+        for (const e of entries) {
+            if (!e.isDirectory()) continue;
+            const code = e.name;
+            try {
+                const dirPath = path.resolve(COUNTRIES_DIR, code);
+                const inner = await fs.readdir(dirPath, { withFileTypes: true });
+                const csvFiles = inner.filter((f) => f.isFile() && f.name.toLowerCase().endsWith('.csv'));
+                if (csvFiles.length > 0) {
+                    dirItems.push({ code, dir: path.join('countries', code), filesCount: csvFiles.length });
+                }
+            } catch {}
+        }
 
         // Attach Russian display name if possible
         let display;
@@ -535,7 +542,7 @@ router.get('/countries', async (_req, res) => {
         } catch {
             display = null;
         }
-        const result = items.map((it) => {
+        const result = dirItems.map((it) => {
             const nameRu = display ? (display.of(it.code.toUpperCase()) || null) : null;
             return { ...it, nameRu };
         });
@@ -592,7 +599,8 @@ router.post('/send', async (req, res) => {
         return res.status(500).json({ error: `Ошибка проверки пикселя в БД: ${e?.message || e}` });
     }
 
-    // Resolve file: if a bare name like "in" is provided, use countries/in.csv (under COUNTRIES_DIR)
+    // Resolve file or directory: if a bare name like "in" is provided and a folder exists, use countries/in/ (under COUNTRIES_DIR);
+    // otherwise fallback to countries/in.csv. If a path is provided, allow directory or file.
     const resolveFilePath = (input) => {
         try {
             console.log('Resolving file path for input:', input);
@@ -601,19 +609,29 @@ router.post('/send', async (req, res) => {
 
             let resolvedPath;
             if (hasSeparator) {
-                // Treat as path (relative or absolute)
-                resolvedPath = path.resolve(input);
+                // Treat as path (relative or absolute) and allow directory
+                const tentative = path.resolve(input);
+                if (fsSync.existsSync(tentative)) {
+                    resolvedPath = tentative;
+                } else {
+                    throw new Error(`Path not found: ${tentative}`);
+                }
             } else {
-                // No separator: treat as countries/<name>[.csv]
-                const baseName = hasCsvExt ? input : `${input}.csv`;
-                resolvedPath = path.resolve(COUNTRIES_DIR, baseName);
+                // No separator: first try a directory countries/<code>/, then countries/<code>.csv
+                const dirCandidate = path.resolve(COUNTRIES_DIR, input);
+                if (fsSync.existsSync(dirCandidate) && fsSync.statSync(dirCandidate).isDirectory()) {
+                    resolvedPath = dirCandidate;
+                } else {
+                    const baseName = hasCsvExt ? input : `${input}.csv`;
+                    resolvedPath = path.resolve(COUNTRIES_DIR, baseName);
+                }
             }
 
             console.log('Resolved path:', resolvedPath);
 
-            // Verify file exists
+            // Verify path exists
             if (!fsSync.existsSync(resolvedPath)) {
-                throw new Error(`File not found: ${resolvedPath}`);
+                throw new Error(`File or directory not found: ${resolvedPath}`);
             }
 
             return resolvedPath;
