@@ -51,6 +51,7 @@
               <th class="px-4 py-2 text-left">ID</th>
               <th class="px-4 py-2 text-left">Статус</th>
               <th class="px-4 py-2 text-left">Прогресс</th>
+              <th class="px-4 py-2 text-left">Рег/Деп</th>
               <th class="px-4 py-2 text-left">%</th>
               <th class="px-4 py-2 text-left">Pixel</th>
               <th class="px-4 py-2 text-left">Действия</th>
@@ -140,7 +141,8 @@
       tr.innerHTML = `
         <td class="px-4 py-2 font-mono">${job.id.slice(0,8)}</td>
         <td class="px-4 py-2 status">${job.status}</td>
-        <td class="px-4 py-2 progress">${job.progress.sent + job.progress.errors}/${job.progress.total} · ok:${job.progress.sent} · err:${job.progress.errors} · рег:${job.progress.leads || 0} · деп:${job.progress.sales || 0}</td>
+        <td class="px-4 py-2 progress">${job.progress.sent + job.progress.errors}/${job.progress.total} (ok:${job.progress.sent} err:${job.progress.errors})</td>
+        <td class="px-4 py-2 leads-sales">${job.progress.leads || 0}/${job.progress.sales || 0}</td>
         <td class="px-4 py-2 percent">${percent(job)}%</td>
         <td class="px-4 py-2">${String(job.pixel)}</td>
         <td class="px-4 py-2 space-x-2 actions">
@@ -164,7 +166,8 @@
       if (!tr) return; // not rendered yet
       const finished = ['completed','failed','completed_with_errors','cancelled'].includes(job.status);
       tr.querySelector('.status').textContent = job.status;
-      tr.querySelector('.progress').textContent = `${job.progress.sent + job.progress.errors}/${job.progress.total} · ok:${job.progress.sent} · err:${job.progress.errors} · рег:${job.progress.leads || 0} · деп:${job.progress.sales || 0}`;
+      tr.querySelector('.progress').textContent = `${job.progress.sent + job.progress.errors}/${job.progress.total} (ok:${job.progress.sent} err:${job.progress.errors})`;
+      tr.querySelector('.leads-sales').textContent = `${job.progress.leads || 0}/${job.progress.sales || 0}`;
       tr.querySelector('.percent').textContent = `${percent(job)}%`;
       const cancelBtn = tr.querySelector('button.cancel');
       if (cancelBtn) cancelBtn.disabled = finished;

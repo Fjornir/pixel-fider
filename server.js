@@ -26,8 +26,6 @@ const DEFAULTS = {
 	reqDelay: 100,            // задержка между запросами (мс)
 	reqTimeout: 30_000,       // таймаут на один запрос (мс)
 	connLimit: 10,            // максимальное число соединений (параллельных запросов)
-	chunkSize: 5,             // количество одновременных запросов в чанке
-	chunkDelay: 500           // задержка между чанками (мс)
 };
 
 // TTLs for Redis entries
@@ -206,6 +204,8 @@ async function sendRequest({ baseUrl, pixel, row, index, reqDelay, reqTimeout, p
 		// Fast cancel check before doing anything
 		if (await isCancelled(jobId)) return null;
 
+		// Determine status to update counters
+		const status = mapStatus(row['\u0421\u0442\u0430\u0441\u0442\u0443\u0441'] ?? row['Статус']);
 		const url = buildUrl(baseUrl, pixel, row);
 		
 		// Python-style detailed logging
@@ -256,6 +256,8 @@ async function sendRequest({ baseUrl, pixel, row, index, reqDelay, reqTimeout, p
 
 					if (response.ok) {
 						progress.sent += 1;
+						if (status === 'lead') progress.leads += 1;
+						if (status === 'sale') progress.sales += 1;
 						console.log(`[job ${jobId}] Отправлен запрос ${progress.sent} из ${progress.total}`);
 						console.log(`[job ${jobId}] Статус ответа: ${response.status}`);
 						console.log(`[job ${jobId}] ---`);
@@ -297,18 +299,6 @@ async function sendRequest({ baseUrl, pixel, row, index, reqDelay, reqTimeout, p
 	}
 }
 
-async function processChunk(sessionOpts, chunk) {
-	const tasks = chunk.map(({ row, index }) =>
-		sendRequest({ ...sessionOpts, row, index })
-	);
-	return Promise.all(tasks);
-}
-
-function chunkArray(arr, size) {
-	const out = [];
-	for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
-	return out;
-}
 
 // Redis helpers for jobs storage
 async function redisSaveJob(job) {
@@ -372,7 +362,7 @@ async function runJob(job) {
 	await acquireJobSlot();
 	
 	try {
-		const { id, pixel, file, baseUrl, chunkSize, reqDelay, chunkDelay, reqTimeout, sessionTimeout, fireAndForget } = job;
+		const { id, pixel, file, baseUrl, reqDelay, reqTimeout, sessionTimeout, fireAndForget } = job;
 		job.status = 'running';
 		job.startedAt = new Date().toISOString();
 		await redisUpdateJobBatched(job, { force: true });
@@ -434,7 +424,7 @@ async function runJob(job) {
     };
 
     // Process CSV files sequentially to reduce memory usage
-    const sessionOpts = { baseUrl, pixel, chunkSize, reqDelay, chunkDelay, reqTimeout, fireAndForget, progress: job.progress, jobId: id };
+    const sessionOpts = { baseUrl, pixel, reqDelay, reqTimeout, fireAndForget, progress: job.progress, jobId: id };
     const hasLimits = (job.limits?.leads || 0) > 0 || (job.limits?.sales || 0) > 0;
     let leadsLeft = job.limits?.leads || 0;
     let salesLeft = job.limits?.sales || 0;
@@ -495,14 +485,12 @@ async function runJob(job) {
             job.progress.total += records.length;
             await redisUpdateJobBatched(job);
 
-            // Process records in chunks like Python version
-            const chunkSize = sessionOpts.chunkSize || DEFAULTS.chunkSize;
-            const chunkDelay = sessionOpts.chunkDelay || DEFAULTS.chunkDelay;
-            
-            console.log(`[job ${id}] Processing ${records.length} records in chunks of ${chunkSize}`);
-            
-            for (let i = 0; i < records.length; i += chunkSize) {
-                // Check cancellation before each chunk
+            // Simplified sequential processing (no chunks)
+            console.log(`[job ${id}] Processing ${records.length} records sequentially...`);
+
+            let reqCounter = 0;
+            for (const row of records) {
+                // Check for cancellation before each request
                 if (await isCancelled(id)) {
                     job.cancelled = true;
                     job.status = 'cancelled';
@@ -523,30 +511,21 @@ async function runJob(job) {
                     return;
                 }
 
-                // Process chunk of records concurrently (like Python asyncio.gather)
-                const chunk = records.slice(i, i + chunkSize);
-                const chunkTasks = chunk.map((row, chunkIndex) => {
-                    const index = totalRecords + i + chunkIndex;
-                    return sendRequest({ ...sessionOpts, row, index });
-                });
-                
-                console.log(`[job ${id}] Processing chunk ${Math.floor(i/chunkSize) + 1}/${Math.ceil(records.length/chunkSize)} (${chunk.length} requests)`);
-                
-                // Wait for all requests in chunk to complete
-                const results = await Promise.allSettled(chunkTasks);
-                
-                // Count successful requests
-                const successful = results.filter(r => r.status === 'fulfilled' && r.value !== null).length;
-                console.log(`[job ${id}] Chunk completed: ${successful}/${chunk.length} successful`);
-                
-                // Update progress after each chunk
-                await redisUpdateJobBatched(job);
-                
-                // Delay between chunks (like Python asyncio.sleep(0.5))
-                if (i + chunkSize < records.length) {
-                    await sleep(chunkDelay);
+                // Send request and wait for it to complete
+                await sendRequest({ ...sessionOpts, row, index: totalRecords + reqCounter });
+
+                reqCounter++;
+
+                // Update progress in Redis periodically to reduce load
+                if (reqCounter % 10 === 0) {
+                    await redisUpdateJobBatched(job);
                 }
+
+                // Delay between requests is now handled inside sendRequest
             }
+
+            // Final progress update for the file
+            await redisUpdateJobBatched(job);
 
             processedFiles++;
             console.log(`Completed file ${processedFiles}/${csvFiles.length}: ${path.basename(csvPath)}`);
@@ -580,7 +559,7 @@ async function runJob(job) {
 }
 
 // Redis-backed job store API
-async function createJob({ pixel, file, baseUrl, chunkSize, reqDelay, chunkDelay, reqTimeout, sessionTimeout, connLimit, fireAndForget = false, leadsCount = 0, salesCount = 0, clientId = null }) {
+async function createJob({ pixel, file, baseUrl, reqDelay, reqTimeout, sessionTimeout, connLimit, fireAndForget = false, leadsCount = 0, salesCount = 0, clientId = null }) {
 	const id = crypto.randomUUID();
 	const job = {
 		id,
@@ -591,9 +570,7 @@ async function createJob({ pixel, file, baseUrl, chunkSize, reqDelay, chunkDelay
 		pixel,
 		file,
 		baseUrl,
-		chunkSize,
 		reqDelay,
-		chunkDelay,
 		reqTimeout,
 		sessionTimeout: (Number(sessionTimeout) > 0 ? Number(sessionTimeout) : null),
 		connLimit,
@@ -819,9 +796,7 @@ router.post('/send', async (req, res) => {
             pixel,
             file: resolvedFile,
             baseUrl: effectiveBaseUrl,
-            chunkSize: Number(req.body.chunkSize) || DEFAULTS.chunkSize,
             reqDelay: Number(reqDelay),
-            chunkDelay: Number(req.body.chunkDelay) || DEFAULTS.chunkDelay,
             reqTimeout: Number(effectiveReqTimeout),
             sessionTimeout: Number(sessionTimeout) > 0 ? Number(sessionTimeout) : null,
             connLimit: Number(connLimit) || DEFAULTS.connLimit,
