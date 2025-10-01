@@ -78,7 +78,7 @@ async function checkMemoryUsage() {
 	let queueLength = 0;
 	try {
 		globalJobs = parseInt(await redis.get(REDIS_JOBS_KEY)) || 0;
-		queueLength = await redis.lLen(REDIS_QUEUE_KEY) || 0;
+		queueLength = await redis.llen(REDIS_QUEUE_KEY) || 0;
 	} catch (e) {
 		// Fallback to local count if Redis fails
 		globalJobs = runningJobs;
@@ -117,7 +117,7 @@ async function acquireJobSlot() {
 			}
 			
 			// Check queue size
-			const queueLength = await redis.lLen(REDIS_QUEUE_KEY) || 0;
+			const queueLength = await redis.llen(REDIS_QUEUE_KEY) || 0;
 			if (queueLength >= MAX_QUEUE_SIZE) {
 				throw new Error(`Job queue is full (${queueLength}/${MAX_QUEUE_SIZE}). Server is overloaded.`);
 			}
@@ -836,7 +836,7 @@ router.post('/send', async (req, res) => {
     // Check server load before creating job (use global Redis counters)
     try {
         const globalJobs = parseInt(await redis.get(REDIS_JOBS_KEY)) || 0;
-        const queueLength = await redis.lLen(REDIS_QUEUE_KEY) || 0;
+        const queueLength = await redis.llen(REDIS_QUEUE_KEY) || 0;
         
         if (globalJobs >= MAX_CONCURRENT_JOBS && queueLength >= MAX_QUEUE_SIZE) {
             return res.status(503).json({ 
@@ -865,13 +865,24 @@ router.post('/send', async (req, res) => {
         });
 
         // Include both id and jobId for compatibility with UI expecting `id`
+        // Get queue position from Redis
+        let queuePosition = 0;
+        try {
+            const globalJobs = parseInt(await redis.get(REDIS_JOBS_KEY)) || 0;
+            if (globalJobs >= MAX_CONCURRENT_JOBS) {
+                queuePosition = Math.max(0, globalJobs - MAX_CONCURRENT_JOBS);
+            }
+        } catch (e) {
+            // Ignore Redis errors for queue position
+        }
+        
         res.status(202).json({ 
             id: job.id, 
             jobId: job.id, 
             status: job.status, 
             file: resolvedFile, 
             clientId: job.clientId,
-            queuePosition: jobQueue.length > 0 ? jobQueue.length : 0
+            queuePosition
         });
     } catch (e) {
         console.error('Job creation failed:', e);
