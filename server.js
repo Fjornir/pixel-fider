@@ -96,8 +96,8 @@ async function acquireJobSlot() {
 	checkMemoryUsage();
 	
 	// Try to atomically increment global job counter in Redis
-	const maxRetries = 50; // Max wait time ~25 seconds
-	for (let i = 0; i < maxRetries; i++) {
+	// Wait indefinitely until a slot becomes available
+	while (true) {
 		try {
 			// Use Redis WATCH/MULTI/EXEC for atomic check-and-increment
 			const currentJobs = parseInt(await redis.get(REDIS_JOBS_KEY)) || 0;
@@ -109,31 +109,23 @@ async function acquireJobSlot() {
 				// Double-check after increment (race condition protection)
 				if (newCount <= MAX_CONCURRENT_JOBS) {
 					runningJobs += 1; // Update local counter
+					console.log(`[acquireJobSlot] Acquired slot (${newCount}/${MAX_CONCURRENT_JOBS} in use)`);
 					return;
 				} else {
-					// We went over limit, decrement back
+					// We went over limit, decrement back and retry
 					await redis.decr(REDIS_JOBS_KEY);
 				}
 			}
 			
-			// Check queue size
-			const queueLength = await redis.llen(REDIS_QUEUE_KEY) || 0;
-			if (queueLength >= MAX_QUEUE_SIZE) {
-				throw new Error(`Job queue is full (${queueLength}/${MAX_QUEUE_SIZE}). Server is overloaded.`);
-			}
-			
-			// Wait 500ms and retry
-			await new Promise(resolve => setTimeout(resolve, 500));
+			// Wait 1 second before retrying (reduce Redis load)
+			await new Promise(resolve => setTimeout(resolve, 1000));
 			
 		} catch (err) {
-			if (err.message.includes('queue is full')) throw err;
 			console.error('[acquireJobSlot] Redis error:', err);
 			// On Redis error, fall back to waiting
-			await new Promise(resolve => setTimeout(resolve, 500));
+			await new Promise(resolve => setTimeout(resolve, 1000));
 		}
 	}
-	
-	throw new Error('Failed to acquire job slot after maximum retries');
 }
 
 async function releaseJobSlot() {
