@@ -52,16 +52,18 @@ let concurrencyInUse = 0;
 const concurrencyWaiters = [];
 
 // Job queue management to prevent server overload
+// Use Redis for global job counting across all cluster processes
 const MAX_CONCURRENT_JOBS = Math.max(1, Number(process.env.MAX_CONCURRENT_JOBS) || 3);
 const MAX_QUEUE_SIZE = Math.max(10, Number(process.env.MAX_QUEUE_SIZE) || 50);
-let runningJobs = 0;
-const jobQueue = [];
+const REDIS_JOBS_KEY = 'pixel:global:running_jobs';
+const REDIS_QUEUE_KEY = 'pixel:global:job_queue';
+let runningJobs = 0; // Local counter for logging
 
 // Memory and resource monitoring
 const MEMORY_CHECK_INTERVAL = 30000; // 30 seconds
 let lastMemoryCheck = 0;
 
-function checkMemoryUsage() {
+async function checkMemoryUsage() {
 	const now = Date.now();
 	if (now - lastMemoryCheck < MEMORY_CHECK_INTERVAL) return;
 	lastMemoryCheck = now;
@@ -71,7 +73,18 @@ function checkMemoryUsage() {
 	const heapTotalMB = Math.round(usage.heapTotal / 1024 / 1024);
 	const rssMB = Math.round(usage.rss / 1024 / 1024);
 	
-	console.log(`[MEMORY] RSS: ${rssMB}MB, Heap: ${heapUsedMB}/${heapTotalMB}MB, Jobs: ${runningJobs}/${MAX_CONCURRENT_JOBS}, Queue: ${jobQueue.length}`);
+	// Get global job count from Redis
+	let globalJobs = 0;
+	let queueLength = 0;
+	try {
+		globalJobs = parseInt(await redisClient.get(REDIS_JOBS_KEY)) || 0;
+		queueLength = await redisClient.lLen(REDIS_QUEUE_KEY) || 0;
+	} catch (e) {
+		// Fallback to local count if Redis fails
+		globalJobs = runningJobs;
+	}
+	
+	console.log(`[MEMORY] RSS: ${rssMB}MB, Heap: ${heapUsedMB}/${heapTotalMB}MB, Local jobs: ${runningJobs}, Global jobs: ${globalJobs}/${MAX_CONCURRENT_JOBS}, Queue: ${queueLength}`);
 	
 	// Warning if memory usage is high
 	if (heapUsedMB > 1000) {
@@ -82,24 +95,61 @@ function checkMemoryUsage() {
 async function acquireJobSlot() {
 	checkMemoryUsage();
 	
-	if (runningJobs < MAX_CONCURRENT_JOBS) {
-		runningJobs += 1;
-		return;
+	// Try to atomically increment global job counter in Redis
+	const maxRetries = 50; // Max wait time ~25 seconds
+	for (let i = 0; i < maxRetries; i++) {
+		try {
+			// Use Redis WATCH/MULTI/EXEC for atomic check-and-increment
+			const currentJobs = parseInt(await redisClient.get(REDIS_JOBS_KEY)) || 0;
+			
+			if (currentJobs < MAX_CONCURRENT_JOBS) {
+				// Atomically increment if still below limit
+				const newCount = await redisClient.incr(REDIS_JOBS_KEY);
+				
+				// Double-check after increment (race condition protection)
+				if (newCount <= MAX_CONCURRENT_JOBS) {
+					runningJobs += 1; // Update local counter
+					return;
+				} else {
+					// We went over limit, decrement back
+					await redisClient.decr(REDIS_JOBS_KEY);
+				}
+			}
+			
+			// Check queue size
+			const queueLength = await redisClient.lLen(REDIS_QUEUE_KEY) || 0;
+			if (queueLength >= MAX_QUEUE_SIZE) {
+				throw new Error(`Job queue is full (${queueLength}/${MAX_QUEUE_SIZE}). Server is overloaded.`);
+			}
+			
+			// Wait 500ms and retry
+			await new Promise(resolve => setTimeout(resolve, 500));
+			
+		} catch (err) {
+			if (err.message.includes('queue is full')) throw err;
+			console.error('[acquireJobSlot] Redis error:', err);
+			// On Redis error, fall back to waiting
+			await new Promise(resolve => setTimeout(resolve, 500));
+		}
 	}
 	
-	// Check queue size limit
-	if (jobQueue.length >= MAX_QUEUE_SIZE) {
-		throw new Error(`Job queue is full (${jobQueue.length}/${MAX_QUEUE_SIZE}). Server is overloaded.`);
-	}
-	
-	await new Promise((resolve) => jobQueue.push(resolve));
-	runningJobs += 1;
+	throw new Error('Failed to acquire job slot after maximum retries');
 }
 
-function releaseJobSlot() {
-	runningJobs -= 1;
-	const next = jobQueue.shift();
-	if (next) next();
+async function releaseJobSlot() {
+	runningJobs -= 1; // Update local counter
+	
+	// Decrement global job counter in Redis
+	try {
+		await redisClient.decr(REDIS_JOBS_KEY);
+		// Ensure it doesn't go below 0
+		const count = parseInt(await redisClient.get(REDIS_JOBS_KEY)) || 0;
+		if (count < 0) {
+			await redisClient.set(REDIS_JOBS_KEY, 0);
+		}
+	} catch (err) {
+		console.error('[releaseJobSlot] Redis error:', err);
+	}
 }
 
 async function acquireConcurrency() {
@@ -553,7 +603,7 @@ async function runJob(job) {
 		await redisUpdateJobBatched(job, { force: true });
 	} finally {
 		// Always release the job slot
-		releaseJobSlot();
+		await releaseJobSlot();
 		console.log(`[job ${job.id}] Released job slot (${runningJobs}/${MAX_CONCURRENT_JOBS} slots now used)`);
 	}
 }
@@ -590,7 +640,7 @@ async function createJob({ pixel, file, baseUrl, reqDelay, reqTimeout, sessionTi
 		job.finishedAt = new Date().toISOString();
 		await redisUpdateJobBatched(job, { force: true });
 		// Make sure to release job slot if job fails to start
-		releaseJobSlot();
+		await releaseJobSlot();
 	});
 	return job;
 }
@@ -783,11 +833,19 @@ router.post('/send', async (req, res) => {
 
     const resolvedFile = resolveFilePath(String(file));
 
-    // Check server load before creating job
-    if (runningJobs >= MAX_CONCURRENT_JOBS && jobQueue.length >= MAX_QUEUE_SIZE) {
-        return res.status(503).json({ 
-            error: `Сервер перегружен. Активных задач: ${runningJobs}/${MAX_CONCURRENT_JOBS}, в очереди: ${jobQueue.length}/${MAX_QUEUE_SIZE}. Попробуйте позже.` 
-        });
+    // Check server load before creating job (use global Redis counters)
+    try {
+        const globalJobs = parseInt(await redisClient.get(REDIS_JOBS_KEY)) || 0;
+        const queueLength = await redisClient.lLen(REDIS_QUEUE_KEY) || 0;
+        
+        if (globalJobs >= MAX_CONCURRENT_JOBS && queueLength >= MAX_QUEUE_SIZE) {
+            return res.status(503).json({ 
+                error: `Сервер перегружен. Активных задач: ${globalJobs}/${MAX_CONCURRENT_JOBS}, в очереди: ${queueLength}/${MAX_QUEUE_SIZE}. Попробуйте позже.` 
+            });
+        }
+    } catch (redisErr) {
+        console.error('[POST /send] Redis check error:', redisErr);
+        // Continue on Redis error - let acquireJobSlot handle it
     }
 
     try {

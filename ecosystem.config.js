@@ -15,6 +15,11 @@ module.exports = {
         // Пул соединений и глобальный лимит параллелизма (сетевые запросы)
         MAX_CONCURRENCY: 30,
         KEEPALIVE_CONNECTIONS: 30,
+        // Количество одновременных задач на процесс
+        MAX_CONCURRENT_JOBS: 5,
+        MAX_QUEUE_SIZE: 50,
+        // MongoDB для валидации пикселей
+        MONGO_URL: 'mongodb://127.0.0.1:27017/pixel-db',
         // Redis и дефолты
         REDIS_URL: 'redis://127.0.0.1:6379/0',
         DEFAULT_ROUTE_URL: '',
@@ -29,6 +34,8 @@ module.exports = {
         // При продовом запуске обычно поднимаем параллелизм
         MAX_CONCURRENCY: 50,
         KEEPALIVE_CONNECTIONS: 50,
+        MAX_CONCURRENT_JOBS: 5,
+        MAX_QUEUE_SIZE: 50,
       },
     },
   ],
