@@ -53,6 +53,10 @@
         <button id="refresh" class="px-4 py-2 rounded bg-slate-200 hover:bg-slate-300" type="button">Обновить список</button>
         <span id="message" class="text-sm text-slate-600"></span>
       </div>
+      <div class="md:col-span-2 flex items-center gap-2">
+        <input id="fire-and-forget" type="checkbox" class="h-4 w-4" />
+        <label for="fire-and-forget" class="text-sm text-slate-700">Не ждать ответа (fire-and-forget)</label>
+      </div>
     </form>
 
     <div class="mt-8">
@@ -408,7 +412,8 @@
           leadsCount,
           salesCount,
           installsCount,
-          eventType
+          eventType,
+          fireAndForget: el('fire-and-forget').checked
         };
         
         const job = await createJob(payload);

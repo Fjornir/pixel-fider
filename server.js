@@ -612,7 +612,7 @@ async function runJob(job) {
 	job.finishedAt = new Date().toISOString();
 	await redisUpdateJobBatched(job, { force: true });
 	await clearCancelled(id);
-	console.log(`[job ${id}] ${job.status} | ok=${job.progress.sent}/${job.progress.total} errors=${job.progress.errors} leads=${job.progress.leads} sales=${job.progress.sales} | maxConcurrency=${MAX_CONCURRENCY} keepAliveConns=${KEEPALIVE_CONNECTIONS}`);
+	console.log(`[job ${id}] ${job.status} | ok=${job.progress.sent}/${job.progress.total} errors=${job.progress.errors} leads=${job.progress.leads} sales=${job.progress.sales} installs=${job.progress.installs || 0} | maxConcurrency=${MAX_CONCURRENCY} keepAliveConns=${KEEPALIVE_CONNECTIONS}`);
 	
 	} catch (jobError) {
 		// Handle any unexpected errors in job execution
@@ -733,7 +733,7 @@ router.get('/', (_req, res) => {
 router.get('/countries', async (_req, res) => {
     try {
         const entries = await fs.readdir(COUNTRIES_DIR, { withFileTypes: true });
-        // New behavior: return country folders (geo codes) that contain CSV files
+        // Return geo folders that contain CSV files either directly or inside event subfolders (lead/sale/install)
         const dirItems = [];
         for (const e of entries) {
             if (!e.isDirectory()) continue;
@@ -741,9 +741,24 @@ router.get('/countries', async (_req, res) => {
             try {
                 const dirPath = path.resolve(COUNTRIES_DIR, code);
                 const inner = await fs.readdir(dirPath, { withFileTypes: true });
-                const csvFiles = inner.filter((f) => f.isFile() && f.name.toLowerCase().endsWith('.csv'));
-                if (csvFiles.length > 0) {
-                    dirItems.push({ code, dir: path.join('countries', code), filesCount: csvFiles.length });
+                const directCsv = inner.filter((f) => f.isFile() && f.name.toLowerCase().endsWith('.csv'));
+                const eventFolders = ['lead', 'sale', 'install'];
+                const breakdown = { lead: 0, sale: 0, install: 0 };
+                let structure = 'old';
+                for (const sub of inner) {
+                    if (!sub.isDirectory()) continue;
+                    const name = sub.name.toLowerCase();
+                    if (!eventFolders.includes(name)) continue;
+                    structure = 'new';
+                    const subdir = path.resolve(dirPath, sub.name);
+                    try {
+                        const files = await fs.readdir(subdir, { withFileTypes: true });
+                        breakdown[name] += files.filter(ff => ff.isFile() && ff.name.toLowerCase().endsWith('.csv')).length;
+                    } catch {}
+                }
+                const totalCsv = directCsv.length + breakdown.lead + breakdown.sale + breakdown.install;
+                if (totalCsv > 0) {
+                    dirItems.push({ code, dir: path.join('countries', code), filesCount: totalCsv, eventTypes: breakdown, structure });
                 }
             } catch {}
         }
