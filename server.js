@@ -629,7 +629,7 @@ async function runJob(job) {
 }
 
 // Redis-backed job store API
-async function createJob({ pixel, file, baseUrl, reqDelay, reqTimeout, sessionTimeout, connLimit, fireAndForget = false, leadsCount = 0, salesCount = 0, clientId = null }) {
+async function createJob({ pixel, file, baseUrl, reqDelay, reqTimeout, sessionTimeout, connLimit, fireAndForget = false, leadsCount = 0, salesCount = 0, installsCount = 0, eventType = null, clientId = null }) {
 	const id = crypto.randomUUID();
 	const job = {
 		id,
@@ -645,10 +645,11 @@ async function createJob({ pixel, file, baseUrl, reqDelay, reqTimeout, sessionTi
 		sessionTimeout: (Number(sessionTimeout) > 0 ? Number(sessionTimeout) : null),
 		connLimit,
 		fireAndForget,
-		progress: { sent: 0, total: 0, errors: 0, leads: 0, sales: 0, logs: [] },
+		progress: { sent: 0, total: 0, errors: 0, leads: 0, sales: 0, installs: 0, logs: [] },
 		error: null,
 		cancelled: false,
-		limits: { leads: Number(leadsCount) || 0, sales: Number(salesCount) || 0 },
+		limits: { leads: Number(leadsCount) || 0, sales: Number(salesCount) || 0, installs: Number(installsCount) || 0 },
+		eventType: eventType ? String(eventType).toLowerCase() : null,
 		clientId: clientId || crypto.randomUUID(),
 	};
 	await redisSaveJob(job);
@@ -776,6 +777,8 @@ router.post('/send', async (req, res) => {
         connLimit = DEFAULTS.connLimit,
         leadsCount = 0,
         salesCount = 0,
+        installsCount = 0,
+        eventType = '',
         clientId: clientIdBody = null,
         // Backward compat: allow "timeout" to set reqTimeout if provided
         timeout,
@@ -853,6 +856,16 @@ router.post('/send', async (req, res) => {
 
     const resolvedFile = resolveFilePath(String(file));
 
+    // Infer event type if not provided and only one counter is non-zero
+    const lc = Number(leadsCount) || 0;
+    const sc = Number(salesCount) || 0;
+    const ic = Number(installsCount) || 0;
+    let effectiveEventType = String(eventType || '').trim().toLowerCase();
+    if (!effectiveEventType) {
+        const nonZero = [lc > 0 ? 'lead' : null, sc > 0 ? 'sale' : null, ic > 0 ? 'install' : null].filter(Boolean);
+        if (nonZero.length === 1) effectiveEventType = nonZero[0];
+    }
+
     // Check server load before creating job (use global Redis counters)
     try {
         const globalJobs = parseInt(await redis.get(REDIS_JOBS_KEY)) || 0;
@@ -881,6 +894,8 @@ router.post('/send', async (req, res) => {
             fireAndForget: Boolean(req.body.fireAndForget) || false,
             leadsCount: Number(leadsCount) || 0,
             salesCount: Number(salesCount) || 0,
+            installsCount: Number(installsCount) || 0,
+            eventType: effectiveEventType || null,
             clientId: String(clientIdHeader || clientIdBody || req.clientId || ''),
         });
 

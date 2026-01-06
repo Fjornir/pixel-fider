@@ -28,12 +28,25 @@
         <div id="file-suggest" class="absolute z-10 mt-1 w-full bg-white border rounded shadow hidden max-h-60 overflow-auto"></div>
       </div>
       <div>
+        <label class="block text-sm font-medium mb-1">Тип события</label>
+        <select id="event-type" class="w-full rounded border px-3 py-2">
+          <option value="">Авто (по лимитам)</option>
+          <option value="lead">lead</option>
+          <option value="sale">sale</option>
+          <option value="install">install</option>
+        </select>
+      </div>
+      <div>
         <label class="block text-sm font-medium mb-1">Количество лидов (Реги)</label>
         <input id="leads-count" type="number" min="0" value="0" class="w-full rounded border px-3 py-2" required />
       </div>
       <div>
         <label class="block text-sm font-medium mb-1">Количество продаж (Депы)</label>
         <input id="sales-count" type="number" min="0" value="0" class="w-full rounded border px-3 py-2" required />
+      </div>
+      <div>
+        <label class="block text-sm font-medium mb-1">Количество установок</label>
+        <input id="installs-count" type="number" min="0" value="0" class="w-full rounded border px-3 py-2" required />
       </div>
       <div class="md:col-span-2 flex items-end gap-3">
         <button class="px-4 py-2 rounded bg-blue-600 text-white hover:bg-blue-700" type="submit">Создать задачу</button>
@@ -51,7 +64,7 @@
               <th class="px-4 py-2 text-left">ID</th>
               <th class="px-4 py-2 text-left">Статус</th>
               <th class="px-4 py-2 text-left">Прогресс</th>
-              <th class="px-4 py-2 text-left">Рег/Деп</th>
+              <th class="px-4 py-2 text-left">Рег/Деп/Инст</th>
               <th class="px-4 py-2 text-left">%</th>
               <th class="px-4 py-2 text-left">Pixel</th>
               <th class="px-4 py-2 text-left">Действия</th>
@@ -142,7 +155,7 @@
         <td class="px-4 py-2 font-mono">${job.id.slice(0,8)}</td>
         <td class="px-4 py-2 status">${job.status}</td>
         <td class="px-4 py-2 progress">${job.progress.sent + job.progress.errors}/${job.progress.total} (ok:${job.progress.sent} err:${job.progress.errors})</td>
-        <td class="px-4 py-2 leads-sales">${job.progress.leads || 0}/${job.progress.sales || 0}</td>
+        <td class="px-4 py-2 leads-sales">${job.progress.leads || 0}/${job.progress.sales || 0}/${job.progress.installs || 0}</td>
         <td class="px-4 py-2 percent">${percent(job)}%</td>
         <td class="px-4 py-2">${String(job.pixel)}</td>
         <td class="px-4 py-2 space-x-2 actions">
@@ -167,7 +180,7 @@
       const finished = ['completed','failed','completed_with_errors','cancelled'].includes(job.status);
       tr.querySelector('.status').textContent = job.status;
       tr.querySelector('.progress').textContent = `${job.progress.sent + job.progress.errors}/${job.progress.total} (ok:${job.progress.sent} err:${job.progress.errors})`;
-      tr.querySelector('.leads-sales').textContent = `${job.progress.leads || 0}/${job.progress.sales || 0}`;
+      tr.querySelector('.leads-sales').textContent = `${job.progress.leads || 0}/${job.progress.sales || 0}/${job.progress.installs || 0}`;
       tr.querySelector('.percent').textContent = `${percent(job)}%`;
       const cancelBtn = tr.querySelector('button.cancel');
       if (cancelBtn) cancelBtn.disabled = finished;
@@ -379,9 +392,11 @@
       try {
         const leadsCount = parseInt(el('leads-count').value) || 0;
         const salesCount = parseInt(el('sales-count').value) || 0;
+        const installsCount = parseInt(el('installs-count').value) || 0;
+        const eventType = (el('event-type').value || '').trim();
         
-        if (leadsCount === 0 && salesCount === 0) {
-          throw new Error('Укажите количество лидов и/или продаж');
+        if (leadsCount === 0 && salesCount === 0 && installsCount === 0) {
+          throw new Error('Укажите количество лидов и/или продаж и/или установок');
         }
 
         const pixel = pixelInput.value.trim();
@@ -391,7 +406,9 @@
           pixel,
           file: fileValue,
           leadsCount,
-          salesCount
+          salesCount,
+          installsCount,
+          eventType
         };
         
         const job = await createJob(payload);
