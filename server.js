@@ -214,7 +214,7 @@ async function setCancelled(jobId) { await redis.set(cancelKey(jobId), '1', 'EX'
 async function clearCancelled(jobId) { await redis.del(cancelKey(jobId)); }
 async function isCancelled(jobId) { return (await redis.get(cancelKey(jobId))) === '1'; }
 
-function buildUrl(baseUrl, pixel, row) {
+function buildUrl(baseUrl, pixel, row, folderEventType = null) {
     // Validate base URL to avoid fetch errors like "Failed to parse URL from ?pixel=..."
     if (!baseUrl || !/^https?:\/\//i.test(String(baseUrl))) {
         throw new Error('Base URL is empty or not absolute (must start with http:// or https://)');
@@ -227,7 +227,7 @@ function buildUrl(baseUrl, pixel, row) {
     const subid = row['Subid'] ?? '';
     const userAgent = encodeURIComponent(String(row['User Agent'] ?? ''));
     const country = row['\u0424\u043b\u0430\u0433 \u0441\u0442\u0440\u0430\u043d\u044b'] ?? row['Флаг страны'] ?? '';
-    const status = mapStatus(row['\u0421\u0442\u0430\u0441\u0442\u0443\u0441'] ?? row['Статус']);
+    const status = folderEventType || mapStatus(row['\u0421\u0442\u0430\u0441\u0442\u0443\u0441'] ?? row['Статус']);
 
     const sep = String(baseUrl).includes('?') ? '&' : '?';
     const url =
@@ -241,14 +241,14 @@ function buildUrl(baseUrl, pixel, row) {
     return url;
 }
 
-async function sendRequest({ baseUrl, pixel, row, index, reqDelay, reqTimeout, progress, jobId, fireAndForget = false }) {
+async function sendRequest({ baseUrl, pixel, row, index, reqDelay, reqTimeout, progress, jobId, fireAndForget = false, folderEventType = null }) {
 	try {
 		// Fast cancel check before doing anything
 		if (await isCancelled(jobId)) return null;
 
-		// Determine status to update counters
-		const status = mapStatus(row['\u0421\u0442\u0430\u0441\u0442\u0443\u0441'] ?? row['Статус']);
-		const url = buildUrl(baseUrl, pixel, row);
+		// Determine status to update counters (folder event type has priority)
+		const status = folderEventType || mapStatus(row['\u0421\u0442\u0430\u0441\u0442\u0443\u0441'] ?? row['Статус']);
+		const url = buildUrl(baseUrl, pixel, row, folderEventType);
 		
 		// Python-style detailed logging
 		console.log(`[job ${jobId}] URL: ${url}`);
@@ -300,6 +300,7 @@ async function sendRequest({ baseUrl, pixel, row, index, reqDelay, reqTimeout, p
 						progress.sent += 1;
 						if (status === 'lead') progress.leads += 1;
 						if (status === 'sale') progress.sales += 1;
+						if (status === 'install') progress.installs = (progress.installs || 0) + 1;
 						console.log(`[job ${jobId}] Отправлен запрос ${progress.sent} из ${progress.total}`);
 						console.log(`[job ${jobId}] Статус ответа: ${response.status}`);
 						console.log(`[job ${jobId}] ---`);
@@ -414,8 +415,8 @@ async function runJob(job) {
 
 		console.log(`[job ${id}] Starting job (${runningJobs}/${MAX_CONCURRENT_JOBS} slots used) - file: ${file}`);
 	
-    // Sequential CSV processing to reduce memory load
-    let csvFiles = [];
+    // Sequential CSV processing with optional event-type subfolders (lead/sale/install)
+    let csvFiles = []; // elements: { path, eventType: 'lead'|'sale'|'install'|null }
     let totalRecords = 0;
     
     try {
@@ -424,13 +425,33 @@ async function runJob(job) {
         if (stat.isDirectory()) {
             console.log(`Input is a directory. Scanning CSV files in: ${file}`);
             const dirEntries = await fs.readdir(file, { withFileTypes: true });
-            csvFiles = dirEntries
-                .filter((e) => e.isFile() && e.name.toLowerCase().endsWith('.csv'))
-                .map((e) => path.resolve(file, e.name));
-            console.log(`Found ${csvFiles.length} CSV files for sequential processing`);
+            const eventFolders = ['lead', 'sale', 'install'];
+            const hasEventFolders = dirEntries.some(e => e.isDirectory() && eventFolders.includes(e.name.toLowerCase()));
+
+            if (hasEventFolders) {
+                const wanted = job.eventType ? [String(job.eventType).toLowerCase()] : eventFolders;
+                for (const entry of dirEntries) {
+                    if (!entry.isDirectory()) continue;
+                    const ev = entry.name.toLowerCase();
+                    if (!wanted.includes(ev)) continue;
+                    const subdir = path.resolve(file, entry.name);
+                    const files = await fs.readdir(subdir, { withFileTypes: true });
+                    for (const f of files) {
+                        if (f.isFile() && f.name.toLowerCase().endsWith('.csv')) {
+                            csvFiles.push({ path: path.resolve(subdir, f.name), eventType: ev });
+                        }
+                    }
+                }
+                console.log(`Found ${csvFiles.length} CSV files in event folders${job.eventType ? ` for ${job.eventType}` : ''}`);
+            } else {
+                csvFiles = dirEntries
+                    .filter((e) => e.isFile() && e.name.toLowerCase().endsWith('.csv'))
+                    .map((e) => ({ path: path.resolve(file, e.name), eventType: null }));
+                console.log(`Found ${csvFiles.length} CSV files for sequential processing`);
+            }
         } else {
             console.log(`Single CSV file: ${file}`);
-            csvFiles = [file];
+            csvFiles = [{ path: file, eventType: null }];
         }
 
         if (csvFiles.length === 0) {
@@ -467,12 +488,15 @@ async function runJob(job) {
 
     // Process CSV files sequentially to reduce memory usage
     const sessionOpts = { baseUrl, pixel, reqDelay, reqTimeout, fireAndForget, progress: job.progress, jobId: id };
-    const hasLimits = (job.limits?.leads || 0) > 0 || (job.limits?.sales || 0) > 0;
+    const hasLimits = (job.limits?.leads || 0) > 0 || (job.limits?.sales || 0) > 0 || (job.limits?.installs || 0) > 0;
     let leadsLeft = job.limits?.leads || 0;
     let salesLeft = job.limits?.sales || 0;
+    let installsLeft = job.limits?.installs || 0;
     let processedFiles = 0;
 
-    for (const csvPath of csvFiles) {
+    for (const fileInfo of csvFiles) {
+        const csvPath = fileInfo.path;
+        const folderEventType = fileInfo.eventType;
         // Check cancellation before each file
         if (await isCancelled(id)) {
             job.cancelled = true;
@@ -495,13 +519,14 @@ async function runJob(job) {
         }
 
         try {
-            console.log(`Processing file ${processedFiles + 1}/${csvFiles.length}: ${path.basename(csvPath)}`);
+            const etLabel = folderEventType ? ` [${folderEventType}]` : '';
+            console.log(`Processing file ${processedFiles + 1}/${csvFiles.length}${etLabel}: ${path.basename(csvPath)}`);
             const csvContent = await fs.readFile(csvPath, 'utf-8');
             let records = parseWithFallbacks(csvContent);
             console.log(`Parsed ${records.length} records from ${path.basename(csvPath)}`);
 
             // Apply limits if specified
-            if (hasLimits && (leadsLeft <= 0 && salesLeft <= 0)) {
+            if (hasLimits && (leadsLeft <= 0 && salesLeft <= 0 && installsLeft <= 0)) {
                 console.log(`Limits reached, skipping remaining files`);
                 break;
             }
@@ -509,18 +534,21 @@ async function runJob(job) {
             if (hasLimits) {
                 const limited = [];
                 for (const rec of records) {
-                    const kind = mapStatus(rec['\u0421\u0442\u0430\u0441\u0442\u0443\u0441'] ?? rec['Статус']);
+                    const kind = folderEventType || mapStatus(rec['\u0421\u0442\u0430\u0441\u0442\u0443\u0441'] ?? rec['Статус']);
                     if (kind === 'lead' && leadsLeft > 0) { 
                         limited.push(rec); 
                         leadsLeft--; 
                     } else if (kind === 'sale' && salesLeft > 0) { 
                         limited.push(rec); 
                         salesLeft--; 
+                    } else if (kind === 'install' && installsLeft > 0) {
+                        limited.push(rec);
+                        installsLeft--;
                     }
-                    if (leadsLeft <= 0 && salesLeft <= 0) break;
+                    if (leadsLeft <= 0 && salesLeft <= 0 && installsLeft <= 0) break;
                 }
                 records = limited;
-                console.log(`Applied limits: ${records.length} records selected (leads left: ${leadsLeft}, sales left: ${salesLeft})`);
+                console.log(`Applied limits: ${records.length} records selected${folderEventType ? ' (from folder: ' + folderEventType + ')' : ''} (leads left: ${leadsLeft}, sales left: ${salesLeft}, installs left: ${installsLeft})`);
             }
 
             // Update total count and process records one by one
@@ -554,7 +582,7 @@ async function runJob(job) {
                 }
 
                 // Send request and wait for it to complete
-                await sendRequest({ ...sessionOpts, row, index: totalRecords + reqCounter });
+                await sendRequest({ ...sessionOpts, row, index: totalRecords + reqCounter, folderEventType });
 
                 reqCounter++;
 
