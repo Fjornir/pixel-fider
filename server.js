@@ -531,24 +531,34 @@ async function runJob(job) {
                 break;
             }
 
+            // Reorder records by event priority: install -> lead -> sale
+            const installs = [];
+            const leads = [];
+            const sales = [];
+            for (const rec of records) {
+                const kind = folderEventType || mapStatus(rec['\u0421\u0442\u0430\u0441\u0442\u0443\u0441'] ?? rec['Статус']);
+                if (kind === 'install') installs.push(rec);
+                else if (kind === 'lead') leads.push(rec);
+                else if (kind === 'sale') sales.push(rec);
+                else leads.push(rec); // unknown -> treat as lead to not block
+            }
+
             if (hasLimits) {
                 const limited = [];
-                for (const rec of records) {
+                // Respect priority when applying limits
+                const prioritized = [...installs, ...leads, ...sales];
+                for (const rec of prioritized) {
                     const kind = folderEventType || mapStatus(rec['\u0421\u0442\u0430\u0441\u0442\u0443\u0441'] ?? rec['Статус']);
-                    if (kind === 'lead' && leadsLeft > 0) { 
-                        limited.push(rec); 
-                        leadsLeft--; 
-                    } else if (kind === 'sale' && salesLeft > 0) { 
-                        limited.push(rec); 
-                        salesLeft--; 
-                    } else if (kind === 'install' && installsLeft > 0) {
-                        limited.push(rec);
-                        installsLeft--;
-                    }
+                    if (kind === 'install' && installsLeft > 0) { limited.push(rec); installsLeft--; }
+                    else if (kind === 'lead' && leadsLeft > 0) { limited.push(rec); leadsLeft--; }
+                    else if (kind === 'sale' && salesLeft > 0) { limited.push(rec); salesLeft--; }
                     if (leadsLeft <= 0 && salesLeft <= 0 && installsLeft <= 0) break;
                 }
                 records = limited;
-                console.log(`Applied limits: ${records.length} records selected${folderEventType ? ' (from folder: ' + folderEventType + ')' : ''} (leads left: ${leadsLeft}, sales left: ${salesLeft}, installs left: ${installsLeft})`);
+                console.log(`Applied limits (priority install->lead->sale): ${records.length} records selected${folderEventType ? ' (from folder: ' + folderEventType + ')' : ''} (leads left: ${leadsLeft}, sales left: ${salesLeft}, installs left: ${installsLeft})`);
+            } else {
+                // No limits - just process in priority order
+                records = [...installs, ...leads, ...sales];
             }
 
             // Update total count and process records one by one
@@ -579,6 +589,14 @@ async function runJob(job) {
                     await redisUpdateJobBatched(job, { force: true });
                     console.error(`[job ${id}] session timeout during processing`);
                     return;
+                }
+
+                // Skip rows without fbclid (from 'Sub ID 28' or 'Sub ID 7')
+                const fbclidVal = row['Sub ID 28'] ?? row['Sub ID 7'] ?? '';
+                if (!String(fbclidVal).trim()) {
+                    console.log(`[job ${id}] Пропуск записи без fbclid`);
+                    if (job.progress.total > 0) job.progress.total -= 1; // keep total for sendable rows only
+                    continue;
                 }
 
                 // Send request and wait for it to complete
@@ -714,6 +732,14 @@ function ensureClientId(req, res, next) {
 	}
 	req.clientId = clientId;
 	next();
+}
+
+// Small helper to avoid hanging endpoints when a backend dependency is slow
+function withBackendTimeout(promise, ms = 3000) {
+    return Promise.race([
+        promise,
+        new Promise((_, reject) => setTimeout(() => reject(new Error(`BackendTimeout ${ms}ms`)), ms)),
+    ]);
 }
 
 app.use(ensureClientId);
@@ -993,8 +1019,13 @@ router.get('/jobs/:id/stream', async (req, res) => {
 router.get('/jobs', async (req, res) => {
 	const clientId = req.get('x-client-id') || req.clientId;
 	if (!clientId) return res.json([]);
-	const list = await redisListJobsByClient(clientId, 200);
-	res.json(list);
+	try {
+		const list = await withBackendTimeout(redisListJobsByClient(clientId, 200), 3000);
+		res.json(list);
+	} catch (e) {
+		console.error('[GET /jobs] Fallback empty list due to:', e?.message || e);
+		res.json([]);
+	}
 });
 
 // Cancel a job
