@@ -20,6 +20,18 @@ dotenv.config();
 const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379/0';
 const redis = new Redis(REDIS_URL);
 
+// ---- Global process-level error handlers to prevent crashes ----
+process.on('unhandledRejection', (reason, p) => {
+    try {
+        console.error('[unhandledRejection] at:', p, 'reason:', reason);
+    } catch {}
+});
+process.on('uncaughtException', (err) => {
+    try {
+        console.error('[uncaughtException]', err);
+    } catch {}
+});
+
 // Default config
 const DEFAULT_ROUTE_URL = process.env.DEFAULT_ROUTE_URL || '';
 const DEFAULTS = {
@@ -1142,6 +1154,15 @@ router.get('/jobs/:id', async (req, res) => {
 		return res.status(404).json({ error: 'Job not found' });
 	}
 	res.json(job);
+});
+
+// ---- Express error handling middleware (must be after routes) ----
+router.use((err, _req, res, _next) => {
+    try {
+        console.error('[ExpressError]', err?.stack || err);
+    } catch {}
+    if (res.headersSent) return;
+    res.status(500).json({ error: 'Internal Server Error' });
 });
 
 // Server-Sent Events stream for a single job
