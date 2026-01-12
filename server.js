@@ -119,7 +119,7 @@ async function getQueueLength() {
 
 async function acquireJobSlot() {
 	checkMemoryUsage();
-	
+	const waitStartedAt = Date.now();
 	// Try to atomically increment global job counter in Redis
 	// Wait indefinitely until a slot becomes available
 	while (true) {
@@ -140,6 +140,11 @@ async function acquireJobSlot() {
 					// We went over limit, decrement back and retry
 					await redis.decr(REDIS_JOBS_KEY);
 				}
+			}
+			// Stale-counter recovery: if waited >30s, no local jobs running, and global counter still full
+			if ((Date.now() - waitStartedAt) > 30000 && runningJobs === 0 && currentJobs >= MAX_CONCURRENT_JOBS) {
+				console.warn('[acquireJobSlot] Detected possible stale global counter. Resetting to 0');
+				try { await redis.set(REDIS_JOBS_KEY, 0); } catch {}
 			}
 			
 			// Wait 1 second before retrying (reduce Redis load)
@@ -774,6 +779,16 @@ async function processQueueOnce() {
 	}
 }
 setInterval(processQueueOnce, 1000);
+// Initialize Redis counters safely and kick the queue once on boot
+async function initQueueSystem() {
+	try {
+		await redis.setnx(REDIS_JOBS_KEY, 0);
+	} catch (e) {
+		console.warn('[initQueueSystem] Failed to init global counters:', e?.message || e);
+	}
+	processQueueOnce().catch(() => {});
+}
+initQueueSystem();
 
 const app = express();
 app.use(express.json());
