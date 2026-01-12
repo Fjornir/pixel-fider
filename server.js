@@ -92,6 +92,31 @@ async function checkMemoryUsage() {
 	}
 }
 
+// ---- Queue helpers ----
+async function enqueueJobId(jobId) {
+    try {
+        await redis.rpush(REDIS_QUEUE_KEY, jobId);
+    } catch (e) {
+        console.error('[enqueueJobId] Redis error:', e);
+        throw e;
+    }
+}
+async function dequeueJobId() {
+    try {
+        return await redis.lpop(REDIS_QUEUE_KEY);
+    } catch (e) {
+        console.error('[dequeueJobId] Redis error:', e);
+        return null;
+    }
+}
+async function getQueueLength() {
+    try {
+        return await redis.llen(REDIS_QUEUE_KEY) || 0;
+    } catch {
+        return 0;
+    }
+}
+
 async function acquireJobSlot() {
 	checkMemoryUsage();
 	
@@ -671,18 +696,55 @@ async function createJob({ pixel, file, baseUrl, reqDelay, reqTimeout, sessionTi
 		clientId: clientId || crypto.randomUUID(),
 	};
 	await redisSaveJob(job);
-	// Fire and forget with proper error handling
-	runJob(job).catch(async (e) => {
-		console.error(`[job ${job.id}] Job creation error:`, e);
-		job.status = 'failed';
-		job.error = `Непредвиденная ошибка: ${e?.message || e}`;
-		job.finishedAt = new Date().toISOString();
-		await redisUpdateJobBatched(job, { force: true });
-		// Make sure to release job slot if job fails to start
-		await releaseJobSlot();
-	});
+	// Enqueue for later processing; files will be read only when job actually starts
+	await enqueueJobId(job.id);
 	return job;
 }
+
+// Background queue processor: periodically pulls jobs from Redis queue and starts them
+let queueProcessorBusy = false;
+async function processQueueOnce() {
+	if (queueProcessorBusy) return;
+	queueProcessorBusy = true;
+	try {
+		// Determine available capacity
+		let current = 0;
+		try { current = parseInt(await redis.get(REDIS_JOBS_KEY)) || 0; } catch {}
+		let available = Math.max(0, MAX_CONCURRENT_JOBS - current);
+		while (available > 0) {
+			const nextId = await dequeueJobId();
+			if (!nextId) break;
+			const job = await redisGetJob(nextId);
+			if (!job) { available--; continue; }
+			if (job.cancelled) {
+				if (!['cancelled','completed','failed','completed_with_errors'].includes(job.status)) {
+					job.status = 'cancelled';
+					job.finishedAt = new Date().toISOString();
+					await redisUpdateJobBatched(job, { force: true });
+				}
+				available--;
+				continue;
+			}
+			if (job.status === 'queued') {
+				job.status = 'starting';
+				await redisUpdateJobBatched(job, { force: true });
+			}
+			// Start the job; runJob will acquire and release the slot
+			runJob(job).catch(async (e) => {
+				console.error(`[job ${job.id}] Unexpected error while starting:`, e);
+				job.status = 'failed';
+				job.error = `Непредвиденная ошибка: ${e?.message || e}`;
+				job.finishedAt = new Date().toISOString();
+				await redisUpdateJobBatched(job, { force: true });
+				try { await releaseJobSlot(); } catch {}
+			});
+			available--;
+		}
+	} finally {
+		queueProcessorBusy = false;
+	}
+}
+setInterval(processQueueOnce, 1000);
 
 const app = express();
 app.use(express.json());
@@ -941,12 +1003,13 @@ router.post('/send', async (req, res) => {
         });
 
         // Include both id and jobId for compatibility with UI expecting `id`
-        // Get queue position from Redis
+        // Compute queue position: if capacity free -> 0, else current queue length minus 1 (since our job was just enqueued at tail)
         let queuePosition = 0;
         try {
-            const globalJobs = parseInt(await redis.get(REDIS_JOBS_KEY)) || 0;
-            if (globalJobs >= MAX_CONCURRENT_JOBS) {
-                queuePosition = Math.max(0, globalJobs - MAX_CONCURRENT_JOBS);
+            const current = parseInt(await redis.get(REDIS_JOBS_KEY)) || 0;
+            if (current >= MAX_CONCURRENT_JOBS) {
+                const qlen = await getQueueLength();
+                queuePosition = Math.max(0, qlen - 1);
             }
         } catch (e) {
             // Ignore Redis errors for queue position
