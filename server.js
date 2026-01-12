@@ -711,6 +711,7 @@ async function processQueueOnce() {
 		let current = 0;
 		try { current = parseInt(await redis.get(REDIS_JOBS_KEY)) || 0; } catch {}
 		let available = Math.max(0, MAX_CONCURRENT_JOBS - current);
+		// Normal path: start up to available jobs
 		while (available > 0) {
 			const nextId = await dequeueJobId();
 			if (!nextId) break;
@@ -739,6 +740,34 @@ async function processQueueOnce() {
 				try { await releaseJobSlot(); } catch {}
 			});
 			available--;
+		}
+
+		// Stuck safeguard: if no available slots detected but queue has items and locally nothing runs,
+		// start one job to let acquireJobSlot handle gating. This helps recover from stale global counters.
+		if (available === 0) {
+			let qlen = 0;
+			try { qlen = await getQueueLength(); } catch {}
+			if (qlen > 0 && runningJobs === 0) {
+				const nextId = await dequeueJobId();
+				if (nextId) {
+					const job = await redisGetJob(nextId);
+					if (job && !job.cancelled) {
+						console.warn('[queue] No slots reported but queue is non-empty and no local jobs – starting one job as safeguard');
+						if (job.status === 'queued') {
+							job.status = 'starting';
+							await redisUpdateJobBatched(job, { force: true });
+						}
+						runJob(job).catch(async (e) => {
+							console.error(`[job ${job.id}] Unexpected error while starting (safeguard):`, e);
+							job.status = 'failed';
+							job.error = `Непредвиденная ошибка: ${e?.message || e}`;
+							job.finishedAt = new Date().toISOString();
+							await redisUpdateJobBatched(job, { force: true });
+							try { await releaseJobSlot(); } catch {}
+						});
+					}
+				}
+			}
 		}
 	} finally {
 		queueProcessorBusy = false;
