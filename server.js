@@ -856,6 +856,66 @@ router.get('/health', (_req, res) => {
 	res.json({ ok: true, serverTime: new Date().toISOString() });
 });
 
+// --- Admin helpers (guarded by ADMIN_TOKEN) ---
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || '';
+function requireAdmin(req, res, next) {
+    if (!ADMIN_TOKEN) return res.status(403).json({ error: 'ADMIN_TOKEN not configured' });
+    const tok = req.get('x-admin-token') || '';
+    if (tok !== ADMIN_TOKEN) return res.status(403).json({ error: 'Forbidden' });
+    next();
+}
+
+async function deleteByPattern(pattern) {
+    let cursor = '0';
+    let total = 0;
+    do {
+        const [next, keys] = await redis.scan(cursor, 'MATCH', pattern, 'COUNT', 1000);
+        cursor = next;
+        if (keys && keys.length) {
+            const pipe = redis.pipeline();
+            for (const k of keys) pipe.del(k);
+            const res = await pipe.exec();
+            for (const [, val] of res) { if (val) total += Number(val) || 0; }
+        }
+    } while (cursor !== '0');
+    return total;
+}
+
+// Clear queue, counters and all job keys
+router.post('/admin/clear-all', requireAdmin, async (_req, res) => {
+    try {
+        const before = {
+            globalJobs: Number(await redis.get(REDIS_JOBS_KEY)) || 0,
+            queueLen: await getQueueLength(),
+        };
+        // Reset counters and queue
+        await redis.set(REDIS_JOBS_KEY, 0);
+        await redis.del(REDIS_QUEUE_KEY);
+        // Delete jobs and indices
+        const delJobs = await deleteByPattern('job:*');
+        const delIdx = await deleteByPattern('jobs:byClient:*');
+        res.json({
+            ok: true,
+            before,
+            after: { globalJobs: 0, queueLen: 0 },
+            deleted: { jobs: delJobs, indices: delIdx },
+        });
+    } catch (e) {
+        res.status(500).json({ error: String(e) });
+    }
+});
+
+// Reset only counters and queue
+router.post('/admin/reset-counters', requireAdmin, async (_req, res) => {
+    try {
+        await redis.set(REDIS_JOBS_KEY, 0);
+        const q = await redis.del(REDIS_QUEUE_KEY);
+        res.json({ ok: true, queueCleared: Boolean(q) });
+    } catch (e) {
+        res.status(500).json({ error: String(e) });
+    }
+});
+
 // Root UI under base path
 router.get('/', (_req, res) => {
     res.sendFile(path.resolve(process.cwd(), 'public', 'index.html'));
@@ -1127,7 +1187,7 @@ router.get('/jobs', async (req, res) => {
 	const clientId = req.get('x-client-id') || req.clientId;
 	if (!clientId) return res.json([]);
 	try {
-		const list = await withBackendTimeout(redisListJobsByClient(clientId, 200), 3000);
+		const list = await withBackendTimeout(redisListJobsByClient(clientId, 200), 7000);
 		res.json(list);
 	} catch (e) {
 		console.error('[GET /jobs] Fallback empty list due to:', e?.message || e);
