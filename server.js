@@ -975,7 +975,9 @@ router.get('/countries', async (_req, res) => {
             display = null;
         }
         const result = dirItems.map((it) => {
-            const nameRu = display ? (display.of(it.code.toUpperCase()) || null) : null;
+            // Use base geo code before hyphen for country display (e.g., "in-avi" -> "IN")
+            const baseCode = String(it.code || '').split('-')[0].toUpperCase();
+            const nameRu = display ? (display.of(baseCode) || null) : null;
             return { ...it, nameRu };
         });
         res.json(result);
