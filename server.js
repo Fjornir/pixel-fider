@@ -691,6 +691,23 @@ async function runJob(job) {
 // Redis-backed job store API
 async function createJob({ pixel, file, baseUrl, reqDelay, reqTimeout, sessionTimeout, connLimit, fireAndForget = false, leadsCount = 0, salesCount = 0, installsCount = 0, eventType = null, clientId = null, pushSet = null, note = null }) {
 	const id = crypto.randomUUID();
+	
+	// Extract file/folder name for pushSet (e.g., "countries/in" -> "in", "countries/in/lead/file.csv" -> "in")
+	let filePushSet = 'default';
+	if (file) {
+		const filePath = String(file);
+		const parts = filePath.split(/[\\/]/);
+		// Find "countries" folder and take the next part (geo code)
+		const countriesIdx = parts.findIndex(p => p === 'countries');
+		if (countriesIdx >= 0 && countriesIdx + 1 < parts.length) {
+			filePushSet = parts[countriesIdx + 1];
+		} else {
+			// Fallback: use last directory or filename without extension
+			const lastPart = parts[parts.length - 1];
+			filePushSet = lastPart.replace(/\.csv$/i, '');
+		}
+	}
+	
 	const job = {
 		id,
 		status: 'queued',
@@ -700,7 +717,7 @@ async function createJob({ pixel, file, baseUrl, reqDelay, reqTimeout, sessionTi
 		pixel,
 		file,
 		baseUrl,
-		pushSet:pushSet || baseUrl || 'default',
+		pushSet: pushSet || filePushSet,
 		note: note || '',
 		reqDelay,
 		reqTimeout,
