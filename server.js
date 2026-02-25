@@ -689,7 +689,7 @@ async function runJob(job) {
 }
 
 // Redis-backed job store API
-async function createJob({ pixel, file, baseUrl, reqDelay, reqTimeout, sessionTimeout, connLimit, fireAndForget = false, leadsCount = 0, salesCount = 0, installsCount = 0, eventType = null, clientId = null }) {
+async function createJob({ pixel, file, baseUrl, reqDelay, reqTimeout, sessionTimeout, connLimit, fireAndForget = false, leadsCount = 0, salesCount = 0, installsCount = 0, eventType = null, clientId = null, pushSet = null, note = null }) {
 	const id = crypto.randomUUID();
 	const job = {
 		id,
@@ -700,6 +700,8 @@ async function createJob({ pixel, file, baseUrl, reqDelay, reqTimeout, sessionTi
 		pixel,
 		file,
 		baseUrl,
+		pushSet: baseUrl || 'default',
+		note: note || '',
 		reqDelay,
 		reqTimeout,
 		sessionTimeout: (Number(sessionTimeout) > 0 ? Number(sessionTimeout) : null),
@@ -1118,6 +1120,8 @@ router.post('/send', async (req, res) => {
             installsCount: Number(installsCount) || 0,
             eventType: effectiveEventType || null,
             clientId: String(clientIdHeader || clientIdBody || req.clientId || ''),
+            pushSet: req.body.pushSet || effectiveBaseUrl,
+            note: req.body.note || '',
         });
 
         // Include both id and jobId for compatibility with UI expecting `id`

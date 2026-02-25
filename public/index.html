@@ -48,6 +48,10 @@
         <label class="block text-sm font-medium mb-1">Количество установок</label>
         <input id="installs-count" type="number" min="0" value="0" class="w-full rounded border px-3 py-2" required />
       </div>
+      <div class="md:col-span-2">
+        <label class="block text-sm font-medium mb-1">Заметка</label>
+        <input id="note" type="text" class="w-full rounded border px-3 py-2" placeholder="Опциональная заметка" />
+      </div>
       <div class="md:col-span-2 flex items-end gap-3">
         <button class="px-4 py-2 rounded bg-blue-600 text-white hover:bg-blue-700" type="submit">Создать задачу</button>
         <button id="refresh" class="px-4 py-2 rounded bg-slate-200 hover:bg-slate-300" type="button">Обновить список</button>
@@ -71,6 +75,8 @@
               <th class="px-4 py-2 text-left">Рег/Деп/Инст</th>
               <th class="px-4 py-2 text-left">%</th>
               <th class="px-4 py-2 text-left">Pixel</th>
+              <th class="px-4 py-2 text-left">Набор пушей</th>
+              <th class="px-4 py-2 text-left">Заметка</th>
               <th class="px-4 py-2 text-left">Действия</th>
             </tr>
           </thead>
@@ -162,6 +168,8 @@
         <td class="px-4 py-2 leads-sales">${job.progress.leads || 0}/${job.progress.sales || 0}/${job.progress.installs || 0}</td>
         <td class="px-4 py-2 percent">${percent(job)}%</td>
         <td class="px-4 py-2">${String(job.pixel)}</td>
+        <td class="px-4 py-2 push-set" title="${job.pushSet || job.baseUrl || 'default'}">${(job.pushSet || job.baseUrl || 'default').substring(0, 30)}${(job.pushSet || job.baseUrl || 'default').length > 30 ? '...' : ''}</td>
+        <td class="px-4 py-2 note" title="${job.note || ''}">${(job.note || '').substring(0, 20)}${(job.note || '').length > 20 ? '...' : ''}</td>
         <td class="px-4 py-2 space-x-2 actions">
           <button data-id="${job.id}" class="cancel px-3 py-1 rounded bg-rose-600 text-white hover:bg-rose-700 disabled:opacity-50" ${['completed','failed','completed_with_errors','cancelled'].includes(job.status) ? 'disabled' : ''}>Отменить</button>
         </td>
@@ -413,7 +421,8 @@
           salesCount,
           installsCount,
           eventType,
-          fireAndForget: el('fire-and-forget').checked
+          fireAndForget: el('fire-and-forget').checked,
+          note: el('note').value.trim()
         };
         
         const job = await createJob(payload);
