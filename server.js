@@ -700,7 +700,7 @@ async function createJob({ pixel, file, baseUrl, reqDelay, reqTimeout, sessionTi
 		pixel,
 		file,
 		baseUrl,
-		pushSet: baseUrl || 'default',
+		pushSet:pushSet || baseUrl || 'default',
 		note: note || '',
 		reqDelay,
 		reqTimeout,
