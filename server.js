@@ -636,7 +636,7 @@ async function runJob(job) {
                 // Skip rows without fbclid (from 'Sub ID 28' or 'Sub ID 7')
                 const fbclidVal = row['Sub ID 28'] ?? row['Sub ID 7'] ?? '';
                 if (!String(fbclidVal).trim()) {
-                    console.log(`[job ${id}] Пропуск записи без fbclid`);
+                    console.log(`[job ${id}] Пропуск записи без fbclid | Sub ID 28: "${row['Sub ID 28']}" | Sub ID 7: "${row['Sub ID 7']}"`);
                     if (job.progress.total > 0) job.progress.total -= 1; // keep total for sendable rows only
                     continue;
                 }
