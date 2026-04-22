@@ -264,7 +264,7 @@ function buildUrl(baseUrl, pixel, row, folderEventType = null) {
 
     // Extract parameters like in Python version
     const pixelValue = String(pixel).replace('.0', ''); // Remove .0 like in Python
-    const fbclid = row['Sub ID 28'] ?? row['Sub ID 7'] ?? '';
+    const fbclid = String(row['Sub ID 28'] || '').trim() || String(row['Sub ID 7'] || '').trim();
     const ip = row['IP'] ?? '';
     const subid = row['Subid'] ?? '';
     const userAgent = encodeURIComponent(String(row['User Agent'] ?? ''));
@@ -634,8 +634,9 @@ async function runJob(job) {
                 }
 
                 // Skip rows without fbclid (from 'Sub ID 28' or 'Sub ID 7')
-                const fbclidVal = row['Sub ID 28'] ?? row['Sub ID 7'] ?? '';
-                if (!String(fbclidVal).trim()) {
+                // Use || instead of ?? to handle empty strings, not just null/undefined
+                const fbclidVal = String(row['Sub ID 28'] || '').trim() || String(row['Sub ID 7'] || '').trim();
+                if (!fbclidVal) {
                     console.log(`[job ${id}] Пропуск записи без fbclid | Sub ID 28: "${row['Sub ID 28']}" | Sub ID 7: "${row['Sub ID 7']}"`);
                     if (job.progress.total > 0) job.progress.total -= 1; // keep total for sendable rows only
                     continue;
